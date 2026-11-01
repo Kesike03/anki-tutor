@@ -12,10 +12,16 @@ SOURCES = (
     "config.json",
     "__init__.py",
     "panel.py",
+    "history.py",
     "protocols.py",
     "context.py",
     "i18n.py",
     "storage.py",
+    "web/chat.js",
+    "web/chat.css",
+    "web/mathjax-config.js",
+    "web/vendor/markdown-it.min.js",
+    "web/vendor/LICENSE.markdown-it",
 )
 
 

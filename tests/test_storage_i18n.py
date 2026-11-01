@@ -1,40 +1,81 @@
+import json
+import sqlite3
 import tempfile
 import unittest
-import json
 from pathlib import Path
 
+from context import SYSTEM_PROMPT
 from i18n import LANGUAGES, STRINGS, tr
 from storage import ConversationStore
 
 
 class StorageTests(unittest.TestCase):
-    def test_card_and_profile_isolation_and_reopen(self):
+    def test_multiple_conversations_and_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             store = ConversationStore(path, "profile-a/collection.anki2")
-            store.append(101, "user", "Question")
-            store.append(101, "assistant", "Answer")
+            first = store.create(101, "What is it?", "Vocabulary")
             images = [{"name": "image.png", "mime": "image/png", "data": "cGljdHVyZQ=="}]
-            store.add_user_message(102, "Other card", "Original prompt", images)
+            store.add_user_message(first, "First question", "Original prompt", images)
+            store.append(first, "assistant", "First answer")
+            second = store.create(101, "What is it?", "Vocabulary")
+            store.add_user_message(second, "Second question", "Another prompt", [])
+            self.assertNotEqual(first, second)
+            self.assertEqual(store.active(101), second)
+            store.select(101, first)
+            self.assertEqual(store.context(first), ("Original prompt", images))
+            self.assertEqual(len(store.list_conversations(101)), 2)
+            backup = store.export_data()
+            self.assertNotIn("api_key", json.dumps(backup))
             store.close()
 
             reopened = ConversationStore(path, "profile-a/collection.anki2")
-            self.assertEqual(reopened.messages(101), [
-                {"role": "user", "content": "Question"},
-                {"role": "assistant", "content": "Answer"},
-            ])
-            reopened.clear(101)
-            self.assertEqual(reopened.messages(101), [])
-            self.assertEqual(reopened.messages(102)[0]["content"], "Other card")
-            reopened.add_user_message(102, "Second question", "New prompt", [])
-            self.assertEqual(reopened.context(102), ("Original prompt", images))
-            reopened.clear(102)
-            self.assertIsNone(reopened.context(102))
+            self.assertEqual(reopened.messages(first)[-1]["content"], "First answer")
+            self.assertEqual(reopened.active(101), first)
+            self.assertEqual(reopened.import_data(backup), (0, 2))
+            reopened.delete_card(101)
+            self.assertEqual(reopened.list_conversations(), [])
+            self.assertEqual(reopened.import_data(backup), (2, 0))
+            self.assertEqual(reopened.import_data(backup), (0, 2))
+            self.assertEqual(len(reopened.list_conversations(101)), 2)
+            reopened.delete_all()
+            self.assertIsNone(reopened.active(101))
             reopened.close()
 
             second_profile = ConversationStore(path, "profile-b/collection.anki2")
-            self.assertEqual(second_profile.messages(102), [])
+            self.assertEqual(second_profile.list_conversations(), [])
             second_profile.close()
+
+    def test_old_profile_migrates_without_losing_messages_or_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            store = ConversationStore(path, "legacy/collection.anki2")
+            database = store.path
+            store.close()
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, card_id INTEGER, role TEXT, content TEXT, created_at INTEGER)")
+            connection.execute("CREATE TABLE contexts (card_id INTEGER PRIMARY KEY, system_prompt TEXT, images_json TEXT)")
+            connection.execute("INSERT INTO messages VALUES (1, 44, 'user', 'Old question', 1)")
+            connection.execute("INSERT INTO messages VALUES (2, 44, 'assistant', 'Old answer', 2)")
+            connection.execute("INSERT INTO contexts VALUES (44, 'Old prompt', '[]')")
+            connection.execute("PRAGMA user_version = 0")
+            connection.commit()
+            connection.close()
+            migrated = ConversationStore(path, "legacy/collection.anki2")
+            conversation = migrated.active(44)
+            self.assertEqual(migrated.messages(conversation)[-1]["content"], "Old answer")
+            self.assertEqual(migrated.context(conversation), ("Old prompt", []))
+            migrated.close()
+
+    def test_invalid_import_does_not_change_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory), "profile/collection.anki2")
+            backup = {"format": "anki-tutor-history", "version": 1,
+                      "conversations": [{"uuid": "bad", "card_id": "wrong"}]}
+            with self.assertRaises(ValueError):
+                store.import_data(backup)
+            self.assertEqual(store.list_conversations(), [])
+            store.close()
 
     def test_translations_have_every_interface_key(self):
         reference = set(STRINGS["en"])
@@ -46,10 +87,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(tr("unknown", "send"), "Send")
 
     def test_packaged_default_matches_source_prompt(self):
-        from context import SYSTEM_PROMPT
-
         config_path = Path(__file__).resolve().parents[1] / "config.json"
-        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))["system_prompt"], SYSTEM_PROMPT)
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config["system_prompt"], SYSTEM_PROMPT)
+        self.assertEqual(config["language"], "auto")
 
 
 if __name__ == "__main__":

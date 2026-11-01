@@ -5,13 +5,13 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+import anki.lang
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from aqt.qt import (
     QCheckBox,
     QColor,
     QComboBox,
     QDockWidget,
-    QEvent,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -33,10 +33,12 @@ from aqt.qt import (
     Qt,
 )
 from aqt.theme import theme_manager
+from aqt.webview import AnkiWebView
 
 from .context import SYSTEM_PROMPT, ImageContextError, build_system_prompt, collect_card_images
 from .i18n import LANGUAGES, tr
 from .protocols import DEFAULTS, ProtocolError, build_request, parse_response, provider_error
+from .history import HistoryDialog
 from .storage import ConversationStore
 
 
@@ -71,17 +73,22 @@ class TutorPanel(QDockWidget):
         super().__init__("Anki Tutor", mw)
         self.mw = mw
         self.config = mw.addonManager.getConfig(__name__) or {}
-        self.config["language"] = self.config.get("language") if self.config.get("language") in LANGUAGES else "en"
+        if self.config.get("language") == "en" and not self.config.get("language_mode_migrated"):
+            self.config["language"] = "auto"
+        self.config["language_mode_migrated"] = True
+        self.config["language"] = self.config.get("language") if self.config.get("language") in (*LANGUAGES, "auto") else "auto"
         self._last_mode = self.config.get("api_mode", "chat")
         if self._last_mode not in DEFAULTS:
             self._last_mode = "chat"
         self.store = None
         self.card = None
+        self.conversation_id = None
         self.covered = False
-        self.drafts: dict[int, str] = {}
+        self.drafts: dict[tuple[int, int | None], str] = {}
         self.errors: dict[int, str] = {}
         self.pending: dict[int, PendingRequest] = {}
         self.network = QNetworkAccessManager(self)
+        self.history_dialog = None
 
         self.setObjectName("ankiTutorDock")
         self.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
@@ -108,7 +115,14 @@ class TutorPanel(QDockWidget):
 
     @property
     def language(self) -> str:
-        return self.config["language"]
+        chosen = self.config.get("language", "auto")
+        if chosen != "auto":
+            return chosen
+        locale = anki.lang.current_lang.lower().replace("_", "-")
+        if locale.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")):
+            return "en"
+        system = locale.split("-")[0]
+        return system if system in LANGUAGES else "en"
 
     def text(self, key: str, **values) -> str:
         return tr(self.language, key, **values)
@@ -156,7 +170,32 @@ class TutorPanel(QDockWidget):
         self.clear_button.setObjectName("tutorTool")
         self.clear_button.clicked.connect(self._clear_chat)
         header_row.addWidget(self.clear_button)
+        self.history_button = QToolButton()
+        self.history_button.setIcon(self._icon(QStyle.StandardPixmap.SP_FileDialogListView))
+        self.history_button.setObjectName("tutorTool")
+        self.history_button.clicked.connect(self._show_history)
+        header_row.addWidget(self.history_button)
         layout.addWidget(header)
+
+        conversation_bar = QFrame(root)
+        conversation_bar.setObjectName("tutorConversationBar")
+        conversation_row = QHBoxLayout(conversation_bar)
+        conversation_row.setContentsMargins(12, 6, 12, 6)
+        conversation_row.setSpacing(6)
+        self.conversation_combo = QComboBox()
+        self.conversation_combo.setMinimumWidth(0)
+        self.conversation_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed,
+        )
+        self.conversation_combo.currentIndexChanged.connect(self._select_conversation)
+        conversation_row.addWidget(self.conversation_combo, 1)
+        self.new_button = QToolButton()
+        self.new_button.setIcon(self._icon(QStyle.StandardPixmap.SP_FileDialogNewFolder))
+        self.new_button.setObjectName("tutorTool")
+        self.new_button.clicked.connect(self._new_conversation)
+        conversation_row.addWidget(self.new_button)
+        layout.addWidget(conversation_bar)
+        self.conversation_bar = conversation_bar
 
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setObjectName("tutorSettingsScroll")
@@ -197,9 +236,10 @@ class TutorPanel(QDockWidget):
         self.model_input = QLineEdit(self.config.get("model", DEFAULTS[self._last_mode][2]))
         self._add_field(settings_layout, "model", self.model_input)
         self.language_combo = QComboBox()
+        self.language_combo.addItem("Follow Anki", "auto")
         for code, name in LANGUAGES.items():
             self.language_combo.addItem(name, code)
-        self.language_combo.setCurrentIndex(self.language_combo.findData(self.language))
+        self.language_combo.setCurrentIndex(self.language_combo.findData(self.config["language"]))
         self._add_field(settings_layout, "language", self.language_combo)
 
         prompt_row = QHBoxLayout()
@@ -262,18 +302,20 @@ class TutorPanel(QDockWidget):
         self.cover_page.layout().addStretch(1)
         self.pages.addWidget(self.cover_page)
 
-        self.chat_scroll = QScrollArea()
-        self.chat_scroll.setObjectName("tutorChatScroll")
-        self.chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.chat_scroll.setWidgetResizable(True)
-        self.chat_content = QWidget()
-        self.chat_content.setObjectName("tutorChatContent")
-        self.chat_layout = QVBoxLayout(self.chat_content)
-        self.chat_layout.setContentsMargins(14, 14, 14, 14)
-        self.chat_layout.setSpacing(12)
-        self.chat_scroll.setWidget(self.chat_content)
-        self.chat_scroll.viewport().installEventFilter(self)
-        self.pages.addWidget(self.chat_scroll)
+        self.chat_web = AnkiWebView(parent=self)
+        self.chat_web.setObjectName("tutorChatWeb")
+        self.chat_web.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.chat_web.stdHtml(
+            '<div id="thread"></div>',
+            css=["/_addons/anki_tutor/web/chat.css"],
+            js=["/_addons/anki_tutor/web/vendor/markdown-it.min.js",
+                "/_anki/js/mathjax.js",
+                "/_addons/anki_tutor/web/mathjax-config.js",
+                "/_anki/js/vendor/mathjax/tex-chtml-full.js",
+                "/_addons/anki_tutor/web/chat.js"],
+            context=self,
+        )
+        self.pages.addWidget(self.chat_web)
         layout.addWidget(self.pages, 1)
 
         self.error_bar = QFrame()
@@ -347,6 +389,12 @@ class TutorPanel(QDockWidget):
         self.settings_button.setAccessibleName(self.text("settings"))
         self.clear_button.setToolTip(self.text("clear"))
         self.clear_button.setAccessibleName(self.text("clear"))
+        self.history_button.setToolTip(self.text("history_manager"))
+        self.history_button.setAccessibleName(self.text("history_manager"))
+        self.new_button.setToolTip(self.text("new_conversation"))
+        self.new_button.setAccessibleName(self.text("new_conversation"))
+        self.conversation_combo.setAccessibleName(self.text("conversation"))
+        self.language_combo.setItemText(0, self.text("auto_language"))
         for name, label in self.field_labels.items():
             label.setText(self.text(name))
         self.key_action.setToolTip(self.text("show_key" if self.key_input.echoMode() == QLineEdit.EchoMode.Password else "hide_key"))
@@ -364,6 +412,8 @@ class TutorPanel(QDockWidget):
         self.composer.setToolTip(self.text("input_tip"))
         self.send_button.setToolTip(self.text("send"))
         self.send_button.setAccessibleName(self.text("send"))
+        if self.history_dialog is not None:
+            self.history_dialog.refresh()
         self._refresh()
 
     def _toggle_settings(self, checked: bool) -> None:
@@ -430,23 +480,31 @@ class TutorPanel(QDockWidget):
             self.store = ConversationStore(
                 Path(__file__).parent / "user_files", self.mw.pm.collectionPath()
             )
+        self._translate()
         self._refresh()
 
     def close_profile(self) -> None:
         self.leave_review()
-        for card_id in list(self.pending):
-            self._cancel_request(card_id)
+        for conversation_id in list(self.pending):
+            self._cancel_request(conversation_id)
         if self.store is not None:
             self.store.close()
             self.store = None
         self.drafts.clear()
         self.errors.clear()
+        if self.history_dialog is not None:
+            self.history_dialog.close()
+            self.history_dialog = None
         self._refresh()
+
+    def _draft_key(self) -> tuple[int, int | None]:
+        return self.card.id, self.conversation_id
 
     def leave_review(self) -> None:
         if self.card is not None:
-            self.drafts[self.card.id] = self.composer.toPlainText()
+            self.drafts[self._draft_key()] = self.composer.toPlainText()
         self.card = None
+        self.conversation_id = None
         self.covered = False
         self.composer.clear()
         self._refresh()
@@ -459,18 +517,120 @@ class TutorPanel(QDockWidget):
             self._refresh()
             return
         if self.card is not None:
-            self.drafts[self.card.id] = self.composer.toPlainText()
+            self.drafts[self._draft_key()] = self.composer.toPlainText()
         self.card = card
-        self.composer.setPlainText(self.drafts.get(card.id, ""))
-        self.covered = bool(self.store.messages(card.id))
+        self.store.update_card(card.id, self._card_label(card), self.mw.col.decks.name(card.current_deck_id()))
+        self.conversation_id = self.store.active(card.id)
+        self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self.covered = bool(self.conversation_id and self.store.messages(self.conversation_id))
+        self._refresh_conversations()
+        self._refresh()
+        self._render_messages()
+
+    def _card_label(self, card) -> str:
+        from .context import readable_text
+
+        try:
+            text = readable_text(card.render_output().question_text)
+        except Exception:
+            text = ""
+        return " ".join(text.split())[:90] or self.text("card", id=card.id)
+
+    def _refresh_conversations(self) -> None:
+        self.conversation_combo.blockSignals(True)
+        self.conversation_combo.clear()
+        if self.card is not None and self.store is not None:
+            entries = self.store.list_conversations(self.card.id)
+            if not entries:
+                self.conversation_combo.addItem(self.text("new_conversation"), None)
+            for entry in entries:
+                self.conversation_combo.addItem(entry["title"], entry["id"])
+            index = self.conversation_combo.findData(self.conversation_id)
+            self.conversation_combo.setCurrentIndex(index)
+        self.conversation_combo.blockSignals(False)
+
+    def _select_conversation(self, index: int) -> None:
+        if self.card is None or self.store is None or index < 0:
+            return
+        conversation_id = self.conversation_combo.itemData(index)
+        if conversation_id == self.conversation_id:
+            return
+        self.drafts[self._draft_key()] = self.composer.toPlainText()
+        self.conversation_id = conversation_id
+        self.store.select(self.card.id, conversation_id)
+        self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self.covered = False
+        self._refresh()
+        self._render_messages()
+
+    def _new_conversation(self) -> None:
+        if self.card is None or self.store is None:
+            return
+        if self.conversation_id is not None and not self.store.messages(self.conversation_id):
+            self.composer.setFocus()
+            return
+        initial_draft = self.composer.toPlainText() if self.conversation_id is None else ""
+        self.drafts[self._draft_key()] = self.composer.toPlainText()
+        if self.conversation_id is None:
+            self.drafts.pop(self._draft_key(), None)
+        self.conversation_id = self.store.create(
+            self.card.id, self._card_label(self.card),
+            self.mw.col.decks.name(self.card.current_deck_id()),
+        )
+        self.composer.setPlainText(initial_draft)
+        self.covered = False
+        self._refresh_conversations()
+        self._refresh()
+        self._render_messages()
+
+    def _show_history(self) -> None:
+        if self.store is None:
+            return
+        if self.history_dialog is None:
+            self.history_dialog = HistoryDialog(self)
+        self.history_dialog.refresh()
+        self.history_dialog.show()
+        self.history_dialog.raise_()
+        self.history_dialog.activateWindow()
+
+    def open_conversation(self, card_id: int, conversation_id: int) -> None:
+        if self.store is None:
+            return
+        self.store.select(card_id, conversation_id)
+        if self.card is not None and self.card.id == card_id:
+            self.drafts[self._draft_key()] = self.composer.toPlainText()
+            self.conversation_id = conversation_id
+            self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+            self.covered = False
+            self._refresh_conversations()
+            self._refresh()
+            self._render_messages()
+
+    def history_changed(self, deleted: set[int] | None = None) -> None:
+        previous_id = self.conversation_id
+        for conversation_id in deleted or set():
+            self._cancel_request(conversation_id)
+            self.errors.pop(conversation_id, None)
+            for key in list(self.drafts):
+                if key[1] == conversation_id:
+                    del self.drafts[key]
+        if self.card is not None and self.store is not None:
+            self.conversation_id = self.store.active(self.card.id)
+            if self.conversation_id != previous_id:
+                self.covered = bool(self.conversation_id and self.store.messages(self.conversation_id))
+                self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self._refresh_conversations()
         self._refresh()
         self._render_messages()
 
     def _refresh(self) -> None:
         card = self.card
         available = card is not None and self.store is not None
-        messages = self.store.messages(card.id) if available else []
-        self.clear_button.setEnabled(bool(messages))
+        messages = self.store.messages(self.conversation_id) if available and self.conversation_id else []
+        self.conversation_bar.setVisible(available)
+        self.new_button.setEnabled(available)
+        self.conversation_combo.setEnabled(available and self.conversation_id is not None)
+        self.clear_button.setEnabled(available and self.conversation_id is not None)
         self.composer.setEnabled(available)
         self._update_send_button()
         self.empty_label.setText(self.text("new_chat" if available else "empty"))
@@ -481,22 +641,22 @@ class TutorPanel(QDockWidget):
             return
         count = len(messages)
         deck_name = self.mw.col.decks.name(card.current_deck_id())
-        status = self.text("thinking") if card.id in self.pending else self.text("messages", count=count)
+        status = self.text("thinking") if self.conversation_id in self.pending else self.text("messages", count=count)
         self.detail.setText(f"{deck_name} | {status}")
         self.detail.setToolTip(self.text("card", id=card.id))
         self.cover_count.setText(self.text("messages", count=count))
-        self.pages.setCurrentWidget(self.cover_page if self.covered else self.chat_scroll if count else self.empty_page)
-        error = self.errors.get(card.id, "")
+        self.pages.setCurrentWidget(self.cover_page if self.covered else self.chat_web if count else self.empty_page)
+        error = self.errors.get(self.conversation_id, "")
         self.error_bar.setVisible(bool(error))
         self.error_label.setText(error)
         can_retry = bool(error and messages and messages[-1]["role"] == "user")
-        self.retry_button.setVisible(can_retry and card.id not in self.pending)
+        self.retry_button.setVisible(can_retry and self.conversation_id not in self.pending)
 
     def _update_send_button(self) -> None:
         self.send_button.setEnabled(
             self.card is not None
             and self.store is not None
-            and self.card.id not in self.pending
+            and self.conversation_id not in self.pending
             and bool(self.composer.toPlainText().strip())
         )
 
@@ -506,77 +666,45 @@ class TutorPanel(QDockWidget):
         self._render_messages()
 
     def _render_messages(self) -> None:
-        while self.chat_layout.count():
-            item = self.chat_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        if self.card is None or self.store is None or self.covered:
-            return
-        for message in self.store.messages(self.card.id):
-            self._add_message(message["role"], message["content"])
-        if self.card.id in self.pending:
-            self._add_message("assistant", self.text("thinking"))
-        self.chat_layout.addStretch(1)
-        QTimer.singleShot(0, self._scroll_to_bottom)
+        messages = (
+            self.store.messages(self.conversation_id)
+            if self.store is not None and self.conversation_id is not None and not self.covered else []
+        )
+        if self.conversation_id in self.pending and not self.covered:
+            messages.append({"role": "assistant", "content": self.text("thinking")})
+        palette = self.mw.app.palette()
+        theme = {
+            "bg": palette.color(QPalette.ColorRole.Window).name(),
+            "surface": palette.color(QPalette.ColorRole.Base).name(),
+            "text": palette.color(QPalette.ColorRole.WindowText).name(),
+            "muted": palette.color(QPalette.ColorRole.PlaceholderText).name(),
+            "border": palette.color(QPalette.ColorRole.Mid).name(),
+            "user": self._user_color(),
+        }
+        payload = {"messages": messages, "you": self.text("you"), "tutor": self.text("tutor"), "theme": theme}
+        self.chat_web.eval(f"window.renderTutorMessages({json.dumps(payload, ensure_ascii=False)});")
 
-    def _add_message(self, role: str, content: str) -> None:
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        bubble = QFrame()
-        bubble.setObjectName("tutorBubble")
-        bubble.setProperty("role", role)
-        bubble.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        bubble.setMaximumWidth(max(200, self.chat_scroll.viewport().width() - 48))
-        body = QVBoxLayout(bubble)
-        body.setContentsMargins(12, 9, 12, 10)
-        body.setSpacing(4)
-        name = QLabel(self.text("you" if role == "user" else "tutor"))
-        name.setObjectName("tutorRole")
-        body.addWidget(name)
-        text = QLabel()
-        text.setTextFormat(Qt.TextFormat.PlainText)
-        text.setText(content)
-        text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        text.setWordWrap(True)
-        text.setMinimumWidth(0)
-        body.addWidget(text)
-        if role == "user":
-            row_layout.addStretch(1)
-            row_layout.addWidget(bubble)
-        else:
-            row_layout.addWidget(bubble)
-            row_layout.addStretch(1)
-        self.chat_layout.addWidget(row)
-
-    def eventFilter(self, object, event) -> bool:
-        if object is self.chat_scroll.viewport() and event.type() == QEvent.Type.Resize:
-            width = max(200, event.size().width() - 48)
-            for bubble in self.chat_content.findChildren(QFrame, "tutorBubble"):
-                bubble.setMaximumWidth(width)
-        return super().eventFilter(object, event)
-
-    def _scroll_to_bottom(self) -> None:
-        bar = self.chat_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
+    def _user_color(self) -> str:
+        palette = self.mw.app.palette()
+        base = palette.color(QPalette.ColorRole.Base)
+        highlight = palette.color(QPalette.ColorRole.Highlight)
+        return QColor(
+            round(base.red() * 0.86 + highlight.red() * 0.14),
+            round(base.green() * 0.86 + highlight.green() * 0.14),
+            round(base.blue() * 0.86 + highlight.blue() * 0.14),
+        ).name()
 
     def _clear_chat(self) -> None:
-        if self.card is None or self.store is None:
+        if self.card is None or self.store is None or self.conversation_id is None:
             return
         if QMessageBox.question(self, self.text("clear"), self.text("confirm_clear")) != QMessageBox.StandardButton.Yes:
             return
-        card_id = self.card.id
-        self._cancel_request(card_id)
-        self.store.clear(card_id)
-        self.errors.pop(card_id, None)
-        self.drafts.pop(card_id, None)
-        self.composer.clear()
-        self.covered = False
-        self._refresh()
-        self._render_messages()
+        old_id = self.conversation_id
+        self.store.delete(old_id)
+        self.history_changed({old_id})
 
     def _send(self) -> None:
-        if self.card is None or self.store is None or self.card.id in self.pending:
+        if self.card is None or self.store is None or self.conversation_id in self.pending:
             return
         message = self.composer.toPlainText().strip()
         if not message:
@@ -584,20 +712,22 @@ class TutorPanel(QDockWidget):
         self._request(message)
 
     def _retry(self) -> None:
-        if self.card is None or self.store is None or self.card.id in self.pending:
+        if self.card is None or self.store is None or self.conversation_id is None or self.conversation_id in self.pending:
             return
-        history = self.store.messages(self.card.id)
+        history = self.store.messages(self.conversation_id)
         if history and history[-1]["role"] == "user":
             self._request(None)
 
     def _request(self, new_message: str | None) -> None:
         self._save_settings()
-        card_id = self.card.id
-        history = self.store.messages(card_id)
+        if self.conversation_id is None:
+            self._new_conversation()
+        conversation_id = self.conversation_id
+        history = self.store.messages(conversation_id)
         if new_message is not None:
             history.append({"role": "user", "content": new_message})
         try:
-            saved_context = self.store.context(card_id)
+            saved_context = self.store.context(conversation_id)
             if saved_context is None:
                 prompt = build_system_prompt(self.card, self.mw.col, self.config)
                 images = collect_card_images(self.card, self.mw.col, self.config)
@@ -605,7 +735,7 @@ class TutorPanel(QDockWidget):
                 prompt, images = saved_context
             spec = build_request(self.config, prompt, history, images)
         except (ProtocolError, ImageContextError) as error:
-            self.errors[card_id] = self.text(str(error))
+            self.errors[conversation_id] = self.text(str(error))
             self._refresh()
             if str(error) in ("missing_key", "missing_model"):
                 self.settings_button.setChecked(True)
@@ -613,7 +743,7 @@ class TutorPanel(QDockWidget):
             return
         except Exception:
             traceback.print_exc()
-            self.errors[card_id] = self.text("context_error")
+            self.errors[conversation_id] = self.text("context_error")
             self._refresh()
             return
 
@@ -622,30 +752,31 @@ class TutorPanel(QDockWidget):
         for name, value in spec.headers.items():
             request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
         reply = self.network.post(request, json.dumps(spec.body, ensure_ascii=False).encode("utf-8"))
-        self.pending[card_id] = PendingRequest(reply, self.config["api_mode"], self.config["api_key"])
-        reply.finished.connect(lambda: self._on_reply(card_id, reply))
+        self.pending[conversation_id] = PendingRequest(reply, self.config["api_mode"], self.config["api_key"])
+        reply.finished.connect(lambda: self._on_reply(conversation_id, reply))
         if new_message is not None:
-            self.store.add_user_message(card_id, new_message, prompt, images)
+            self.store.add_user_message(conversation_id, new_message, prompt, images)
             self.composer.clear()
-            self.drafts.pop(card_id, None)
-        self.errors.pop(card_id, None)
+            self.drafts.pop(self._draft_key(), None)
+        self.errors.pop(conversation_id, None)
         self.covered = False
         self.settings_button.setChecked(False)
         self._toggle_settings(False)
+        self._refresh_conversations()
         self._refresh()
         self._render_messages()
 
-    def _cancel_request(self, card_id: int) -> None:
-        pending = self.pending.pop(card_id, None)
+    def _cancel_request(self, conversation_id: int) -> None:
+        pending = self.pending.pop(conversation_id, None)
         if pending is not None:
             pending.reply.abort()
 
-    def _on_reply(self, card_id: int, reply: QNetworkReply) -> None:
-        pending = self.pending.get(card_id)
+    def _on_reply(self, conversation_id: int, reply: QNetworkReply) -> None:
+        pending = self.pending.get(conversation_id)
         reply.deleteLater()
         if pending is None or pending.reply is not reply or self.store is None:
             return
-        del self.pending[card_id]
+        del self.pending[conversation_id]
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         try:
             data = json.loads(bytes(reply.readAll()).decode("utf-8"))
@@ -664,15 +795,16 @@ class TutorPanel(QDockWidget):
                 error = self.text(str(exception))
             else:
                 error = ""
-                self.store.append(card_id, "assistant", answer)
+                self.store.append(conversation_id, "assistant", answer)
         if error:
             for key in (pending.api_key, self.config.get("api_key", "")):
                 if key:
                     error = error.replace(key, "[redacted]")
-            self.errors[card_id] = f"{self.text('failed')}: {error}"
+            self.errors[conversation_id] = f"{self.text('failed')}: {error}"
         else:
-            self.errors.pop(card_id, None)
-        if self.card is not None and self.card.id == card_id:
+            self.errors.pop(conversation_id, None)
+        if self.conversation_id == conversation_id:
+            self._refresh_conversations()
             self._refresh()
             self._render_messages()
 
@@ -696,13 +828,13 @@ class TutorPanel(QDockWidget):
         user = mix(surface_color, accent_color, 0.13 if not theme_manager.night_mode else 0.24)
         danger = mix(bg_color, QColor("#d85a53"), 0.15)
         self.setStyleSheet(f"""
-            QWidget#tutorRoot, QWidget#tutorPage, QWidget#tutorChatContent,
-            QStackedWidget#tutorPages, QScrollArea#tutorChatScroll,
+            QWidget#tutorRoot, QWidget#tutorPage, QStackedWidget#tutorPages,
             QScrollArea#tutorSettingsScroll {{ background: {bg}; color: {text}; }}
             QFrame#tutorHeader, QFrame#tutorFooter, QWidget#tutorSettings {{
                 background: {bg}; color: {text};
             }}
             QFrame#tutorHeader {{ border-bottom: 1px solid {border}; }}
+            QFrame#tutorConversationBar {{ background: {bg}; border-bottom: 1px solid {border}; }}
             QFrame#tutorFooter {{ border-top: 1px solid {border}; }}
             QLabel#tutorHeading {{ color: {text}; font-size: 14px; font-weight: 600; }}
             QLabel#tutorDetail, QLabel#tutorEmpty {{ color: {muted}; font-size: 12px; }}
@@ -712,11 +844,8 @@ class TutorPanel(QDockWidget):
             QToolButton#tutorTool:hover, QToolButton#tutorTool:checked {{ background: {user}; }}
             QPushButton#tutorLinkButton {{ border: 0; background: transparent;
                 color: {accent}; padding: 4px; }}
-            QFrame#tutorBubble {{ border-radius: 5px; background: {surface};
-                border: 1px solid {border}; color: {text}; }}
-            QFrame#tutorBubble[role="user"] {{ background: {user}; border-color: {user}; }}
-            QFrame#tutorBubble QLabel, QFrame#tutorError QLabel {{ color: {text}; }}
-            QFrame#tutorBubble QLabel#tutorRole {{ color: {accent}; font-size: 11px; font-weight: 600; }}
+            QFrame#tutorError QLabel {{ color: {text}; }}
             QToolButton#tutorSend {{ min-width: 30px; min-height: 30px; }}
             QFrame#tutorError {{ background: {danger}; color: {text}; }}
         """)
+        self._render_messages()

@@ -35,9 +35,22 @@ class FakeAddons:
 
 
 def load_panel():
+    anki = types.ModuleType("anki")
+    anki.lang = types.ModuleType("anki.lang")
+    anki.lang.current_lang = "en_US"
+    sys.modules.update({"anki": anki, "anki.lang": anki.lang})
     aqt = types.ModuleType("aqt")
     aqt.qt = types.ModuleType("aqt.qt")
     aqt.theme = types.ModuleType("aqt.theme")
+    aqt.webview = types.ModuleType("aqt.webview")
+    class FakeWeb(QtWidgets.QWidget):
+        def stdHtml(self, *args, **kwargs):
+            self.html = (args, kwargs)
+
+        def eval(self, code):
+            self.last_js = code
+
+    aqt.webview.AnkiWebView = FakeWeb
     aqt.theme.theme_manager = SimpleNamespace(night_mode=False)
     aqt.gui_hooks = SimpleNamespace(theme_did_change=[])
     for name in (
@@ -45,13 +58,15 @@ def load_panel():
         "QLabel", "QLineEdit", "QMessageBox", "QPlainTextEdit", "QPushButton",
         "QScrollArea", "QSizePolicy", "QStackedWidget", "QStyle", "QTextEdit",
         "QTimer", "QToolButton", "QUrl", "QVBoxLayout", "QWidget", "Qt",
-        "QColor", "QPalette",
+        "QColor", "QPalette", "QTreeWidget", "QTreeWidgetItem", "QDialog",
+        "QFileDialog",
     ):
         for source in (QtWidgets, QtCore, QtGui):
             if hasattr(source, name):
                 setattr(aqt.qt, name, getattr(source, name))
                 break
-    sys.modules.update({"aqt": aqt, "aqt.qt": aqt.qt, "aqt.theme": aqt.theme})
+    sys.modules.update({"aqt": aqt, "aqt.qt": aqt.qt, "aqt.theme": aqt.theme,
+                        "aqt.webview": aqt.webview})
     root = Path(__file__).resolve().parents[1]
     package = types.ModuleType("anki_tutor")
     package.__path__ = [str(root)]
@@ -137,8 +152,9 @@ class PanelTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertFalse(self.panel.pending)
             self.assertEqual(captured[0]["messages"][0]["content"].split("\n")[0], "Custom tutor instructions")
-            self.assertEqual(self.panel.store.messages(101)[-1]["content"], "It is a greeting.")
-            self.assertEqual(self.panel.store.messages(102), [])
+            first_id = self.panel.store.active(101)
+            self.assertEqual(self.panel.store.messages(first_id)[-1]["content"], "It is a greeting.")
+            self.assertIsNone(self.panel.store.active(102))
             self.panel.show_card(self.card(101))
             self.assertTrue(self.panel.covered)
             self.panel._reveal()
@@ -147,8 +163,8 @@ class PanelTests(unittest.TestCase):
             self.assertEqual(self.panel.clear_button.toolTip(), "清空对话")
             with patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.StandardButton.Yes):
                 self.panel._clear_chat()
-            self.assertEqual(self.panel.store.messages(101), [])
-            self.assertIsNone(self.panel.store.context(101))
+            self.assertIsNone(self.panel.store.active(101))
+            self.assertIsNone(self.panel.store.context(first_id))
         finally:
             server.shutdown()
             server.server_close()
@@ -171,6 +187,27 @@ class PanelTests(unittest.TestCase):
         self.assertFalse(self.panel.isFloating())
         self.assertEqual(self.mw.dockWidgetArea(self.panel), QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
         self.assertFalse(self.panel.dock_button.isVisible())
+
+    def test_two_conversations_and_anki_language(self):
+        import anki.lang
+
+        anki.lang.current_lang = "zh_CN"
+        self.panel._translate()
+        self.assertEqual(self.panel.clear_button.toolTip(), "清空对话")
+        self.panel.show_card(self.card(101))
+        self.panel._new_conversation()
+        first = self.panel.conversation_id
+        self.panel.store.add_user_message(first, "First question", "Tutor prompt", [])
+        self.panel._new_conversation()
+        second = self.panel.conversation_id
+        self.assertNotEqual(first, second)
+        self.panel.conversation_combo.setCurrentIndex(self.panel.conversation_combo.findData(first))
+        self.assertEqual(self.panel.conversation_id, first)
+        self.panel._show_history()
+        self.assertEqual(self.panel.history_dialog.tree.topLevelItemCount(), 1)
+        self.assertEqual(self.panel.history_dialog.tree.topLevelItem(0).childCount(), 2)
+        self.panel.history_dialog.hide()
+        anki.lang.current_lang = "en_US"
 
 
 if __name__ == "__main__":

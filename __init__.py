@@ -45,18 +45,12 @@ def _on_addon_install(manager, module) -> None:
         _panel.close_profile()
 
 
-def _on_addon_installed(manager, module) -> None:
-    if _panel is not None and module == manager.addonFromModule(__name__):
-        _panel.open_profile()
-
-
 gui_hooks.main_window_did_init.append(_on_main_window_ready)
 gui_hooks.profile_did_open.append(_on_profile_open)
 gui_hooks.profile_will_close.append(_on_profile_close)
 gui_hooks.reviewer_did_show_question.append(_on_question)
 gui_hooks.reviewer_did_show_answer.append(_on_answer)
 gui_hooks.state_did_change.append(_on_state_change)
+mw.addonManager.setWebExports(__name__, r"web/.*")
 if hook := getattr(gui_hooks, "addon_manager_will_install_addon", None):
     hook.append(_on_addon_install)
-if hook := getattr(gui_hooks, "addon_manager_did_install_addon", None):
-    hook.append(_on_addon_installed)
