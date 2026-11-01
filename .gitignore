@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+dist/
+user_files/
+meta.json
+.env
+.env.*
+.venv/
+*.sqlite3
+*.anki2
+.DS_Store
