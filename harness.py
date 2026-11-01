@@ -6,13 +6,16 @@ import re
 
 
 INSTRUCTIONS = """
-Anki editing tools are available when the user explicitly asks to change their collection.
-To propose changes, finish your answer with exactly one fenced block named anki-actions
-containing a JSON object {"actions": [...]} (up to 10 actions). Supported actions:
+You have permission to use Anki editing tools; never tell the user you lack access to Anki.
+When the user explicitly asks you to add, edit, or delete cards, or to change review settings,
+do not merely explain what they could do. Propose the change with exactly one fenced block
+named anki-actions at the end of your answer, containing JSON {"actions": [...]} (1-10 actions).
+The Anki client will show a confirmation dialog and execute the actions with native APIs.
+Use the exact current card ID and deck name supplied below. Supported actions:
 - {"type":"add_card","front":"text","back":"text","deck":"existing deck name"}
   Optional: "notetype":"Basic". The deck and note type must already exist.
 - {"type":"edit_card","card_id":123,"front":"new text","back":"new text"}
-  Provide at least one side; omitted card_id targets the card being discussed.
+  Provide at least one side; omitted card_id targets the current card being discussed.
   For non-Basic note types, use "fields":{"Field Name":"new text"} instead.
 - {"type":"delete_card","card_id":123} (card_id optional for the current card).
 - {"type":"set_review_options","deck":"existing deck name","changes":{
@@ -22,9 +25,34 @@ containing a JSON object {"actions": [...]} (up to 10 actions). Supported action
   Include only the settings the user requested; omitted deck targets the current card's deck.
 These are proposals, not executed until the user confirms them in Anki. Never claim a
 change has already happened in your answer. Do not emit this block for ordinary tutoring.
+Current Anki context for actions: CARD_ID=__CARD_ID__; DECK=__DECK__; NOTE_TYPE=__NOTETYPE__;
+NOTE_FIELDS=__FIELDS__; KNOWN_DECKS=__DECKS__; KNOWN_NOTE_TYPES=__NOTETYPES__.
 """
 
 BLOCK = re.compile(r"(?m)^```anki-actions[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
+GENERIC_BLOCK = re.compile(r"(?m)^```(?:json)?[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
+
+
+def instructions_for(card, col) -> str:
+    try:
+        deck_name = col.decks.name(card.current_deck_id())
+        notetype = card.note_type()["name"]
+        fields = list(card.note().keys())
+    except Exception:
+        deck_name, notetype, fields = "", "Basic", ["Front", "Back"]
+    try:
+        decks = [entry.name for entry in col.decks.all_names_and_ids()][:50]
+        notetypes = [entry.name for entry in col.models.all_names_and_ids()][:30]
+    except Exception:
+        decks, notetypes = [deck_name], [notetype]
+    replacements = {
+        "__CARD_ID__": str(card.id), "__DECK__": deck_name, "__NOTETYPE__": notetype,
+        "__FIELDS__": repr(fields), "__DECKS__": repr(decks), "__NOTETYPES__": repr(notetypes),
+    }
+    result = INSTRUCTIONS
+    for marker, value in replacements.items():
+        result = result.replace(marker, value)
+    return result
 OPTIONS = {
     "new.perDay": (int, 0, 10000),
     "rev.perDay": (int, 0, 10000),
@@ -36,24 +64,37 @@ OPTIONS = {
 }
 
 
+def _payload(match) -> dict | None:
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("actions"), list):
+        return payload
+    return None
+
+
 def extract_plan(answer: str) -> tuple[str, list[dict] | None]:
     matches = list(BLOCK.finditer(answer))
-    if not matches:
+    match = matches[0] if matches else None
+    if match is None:
+        for candidate in reversed(list(GENERIC_BLOCK.finditer(answer))):
+            if _payload(candidate) is not None:
+                match = candidate
+                break
+    if match is None:
         return answer, None
-    if len(matches) != 1 or answer[matches[0].end():].strip():
-        raise ValueError("Expected one action block at the end of the response")
-    try:
-        payload = json.loads(matches[0].group(1))
-    except json.JSONDecodeError as error:
-        raise ValueError("Invalid Anki action JSON") from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("actions"), list):
-        raise ValueError("Invalid Anki actions")
+    if answer[match.end():].strip():
+        raise ValueError("The action block must be at the end of the response")
+    payload = _payload(match)
+    if payload is None:
+        raise ValueError("Invalid Anki action JSON")
     actions = payload["actions"]
     if not 1 <= len(actions) <= 10:
         raise ValueError("Anki actions must contain 1 to 10 changes")
     for action in actions:
         validate_action(action)
-    return answer[:matches[0].start()].rstrip(), actions
+    return answer[:match.start()].rstrip(), actions
 
 
 def validate_action(action: dict) -> None:

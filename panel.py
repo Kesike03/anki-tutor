@@ -1,5 +1,6 @@
 """Anki's docked conversation interface and asynchronous network client."""
 
+import base64
 import json
 import traceback
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import anki.lang
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from aqt.qt import (
     QApplication,
+    QBuffer,
     QCheckBox,
     QColor,
     QComboBox,
@@ -17,9 +19,11 @@ from aqt.qt import (
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QIODevice,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPalette,
     QPlainTextEdit,
@@ -40,8 +44,8 @@ from aqt.theme import theme_manager
 from aqt.webview import AnkiWebView
 
 from .context import SYSTEM_PROMPT, ImageContextError, build_system_prompt, collect_card_images
-from .attachments import AttachmentError, load_files
-from .harness import INSTRUCTIONS, describe, execute, extract_plan
+from .attachments import AttachmentError, load_files, local_file_references
+from .harness import describe, execute, extract_plan, instructions_for
 from .i18n import LANGUAGES, tr
 from .protocols import DEFAULTS, ProtocolError, build_request, parse_response, provider_error
 from .history import HistoryDialog
@@ -49,9 +53,12 @@ from .storage import ConversationStore
 
 
 class Composer(QTextEdit):
-    def __init__(self, send, parent=None) -> None:
+    def __init__(self, send, attach_paths=None, attach_image=None, parent=None) -> None:
         super().__init__(parent)
         self._send = send
+        self._attach_paths = attach_paths
+        self._attach_image = attach_image
+        self.setAcceptDrops(True)
         self._composing = False
 
     def inputMethodEvent(self, event) -> None:
@@ -65,6 +72,44 @@ class Composer(QTextEdit):
             self._send()
             return
         super().keyPressEvent(event)
+
+    @staticmethod
+    def _local_paths(mime) -> list[str]:
+        return [
+            url.toLocalFile() for url in mime.urls()
+            if url.isLocalFile() and url.toLocalFile()
+        ]
+
+    def canInsertFromMimeData(self, source) -> bool:
+        return bool(source.hasImage() or self._local_paths(source)) or super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source) -> None:
+        paths = self._local_paths(source)
+        if paths and self._attach_paths:
+            self._attach_paths(paths)
+            return
+        if source.hasImage() and self._attach_image:
+            self._attach_image(source.imageData())
+            return
+        super().insertFromMimeData(source)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasImage() or self._local_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        paths = self._local_paths(event.mimeData())
+        if paths and self._attach_paths:
+            self._attach_paths(paths)
+            event.acceptProposedAction()
+            return
+        if event.mimeData().hasImage() and self._attach_image:
+            self._attach_image(event.mimeData().imageData())
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
 
 @dataclass
@@ -350,7 +395,9 @@ class TutorPanel(QDockWidget):
         footer_layout.setSpacing(5)
         attachment_row = QHBoxLayout()
         self.attachment_list = QListWidget()
+        self.attachment_list.setObjectName("tutorAttachmentList")
         self.attachment_list.setFixedHeight(55)
+        self.attachment_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.attachment_list.hide()
         attachment_row.addWidget(self.attachment_list, 1)
         self.remove_attachment_button = QToolButton()
@@ -361,7 +408,7 @@ class TutorPanel(QDockWidget):
         footer_layout.addLayout(attachment_row)
         composer_row = QHBoxLayout()
         composer_row.setSpacing(8)
-        self.composer = Composer(self._send)
+        self.composer = Composer(self._send, self._attach_paths, self._attach_image)
         self.composer.setObjectName("tutorComposer")
         self.composer.setMinimumHeight(64)
         self.composer.setMaximumHeight(112)
@@ -546,28 +593,67 @@ class TutorPanel(QDockWidget):
         self.attachments = list(self.attachment_drafts.get(self._draft_key(), []))
         self._refresh_attachments()
 
-    def _refresh_attachments(self) -> None:
+    def _refresh_attachments(self, select_index: int | None = None) -> None:
+        previous = self.attachment_list.currentRow()
         self.attachment_list.clear()
-        self.attachment_list.addItems([item["name"] for item in self.attachments])
-        self.attachment_list.setVisible(bool(self.attachments))
-        self.remove_attachment_button.setVisible(bool(self.attachments))
+        for item in self.attachments:
+            list_item = QListWidgetItem(item["name"])
+            list_item.setToolTip(f"{item['name']} ({item.get('kind', 'file')})")
+            self.attachment_list.addItem(list_item)
+        visible = bool(self.attachments)
+        self.attachment_list.setVisible(visible)
+        self.remove_attachment_button.setVisible(visible)
+        self.remove_attachment_button.setEnabled(visible)
+        if visible:
+            if select_index is None:
+                select_index = previous if previous >= 0 else len(self.attachments) - 1
+            self.attachment_list.setCurrentRow(
+                max(0, min(select_index, len(self.attachments) - 1))
+            )
         self._update_send_button()
 
     def _choose_attachments(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, self.text("attach"))
-        if not paths:
-            return
+        if paths:
+            self._attach_paths(paths)
+
+    def _attach_paths(self, paths: list[str]) -> None:
+        previous_count = len(self.attachments)
         try:
             self.attachments = load_files(paths, self.attachments)
         except (AttachmentError, OSError) as error:
             QMessageBox.warning(self, self.text("attach"), f"{self.text('attachment_error')}: {error}")
-        self._refresh_attachments()
+        self._refresh_attachments(
+            len(self.attachments) - 1 if len(self.attachments) > previous_count else None
+        )
+
+    def _attach_image(self, image) -> None:
+        if image is None or image.isNull():
+            return
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return
+        data = bytes(buffer.data())
+        if sum(len(item.get("data", "")) * 3 // 4 for item in self.attachments) + len(data) > 20 * 1024 * 1024:
+            QMessageBox.warning(self, self.text("attach"), self.text("attachment_error"))
+            return
+        self.attachments.append({
+            "name": f"pasted-image-{len(self.attachments) + 1}.png",
+            "kind": "image", "mime": "image/png",
+            "data": base64.b64encode(data).decode("ascii"),
+        })
+        self._refresh_attachments(len(self.attachments) - 1)
 
     def _remove_attachment(self) -> None:
+        if not self.attachments:
+            return
         index = self.attachment_list.currentRow()
-        if index >= 0:
-            self.attachments.pop(index)
-            self._refresh_attachments()
+        if index < 0:
+            index = len(self.attachments) - 1
+        self.attachments.pop(index)
+        self._save_draft()
+        self._refresh_attachments(min(index, len(self.attachments) - 1))
 
     def leave_review(self) -> None:
         self._save_draft()
@@ -826,6 +912,13 @@ class TutorPanel(QDockWidget):
         if self.card is None or self.store is None or self.conversation_id in self.pending:
             return
         message = self.composer.toPlainText().strip()
+        message, paths = local_file_references(message)
+        if paths:
+            try:
+                self.attachments = load_files(paths, self.attachments)
+            except (AttachmentError, OSError) as error:
+                QMessageBox.warning(self, self.text("attach"), f"{self.text('attachment_error')}: {error}")
+            self._refresh_attachments()
         if not message and not self.attachments:
             return
         self._request(message or self.text("attachment_only"), attachments=list(self.attachments))
@@ -862,7 +955,7 @@ class TutorPanel(QDockWidget):
                 images = collect_card_images(self.card, self.mw.col, self.config)
             else:
                 prompt, images = saved_context
-            spec = build_request(self.config, prompt + "\n\n" + INSTRUCTIONS, history, images)
+            spec = build_request(self.config, prompt + "\n\n" + instructions_for(self.card, self.mw.col), history, images)
         except (ProtocolError, ImageContextError) as error:
             key = str(error)
             self.errors[conversation_id] = self.text(key) if key in ("missing_key", "missing_model", "invalid_host", "invalid_path", "invalid_response", "image_error", "pdf_not_supported") else key
@@ -1046,6 +1139,12 @@ class TutorPanel(QDockWidget):
             QToolButton#tutorTool:hover, QToolButton#tutorTool:checked {{ background: {user}; }}
             QPushButton#tutorLinkButton {{ border: 0; background: transparent;
                 color: {accent}; padding: 4px; }}
+            QListWidget#tutorAttachmentList {{ background: {surface}; color: {text};
+                border: 1px solid {border}; border-radius: 4px; padding: 2px; }}
+            QListWidget#tutorAttachmentList::item {{ padding: 3px 5px; }}
+            QListWidget#tutorAttachmentList::item:selected {{
+                background: {accent}; color: {surface};
+            }}
             QFrame#tutorError QLabel {{ color: {text}; }}
             QToolButton#tutorSend {{ min-width: 30px; min-height: 30px; }}
             QFrame#tutorError {{ background: {danger}; color: {text}; }}

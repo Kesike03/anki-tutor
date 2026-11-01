@@ -6,7 +6,7 @@ Anki Tutor adds an AI chat panel to Anki's review window. Each card can have mul
 
 - **Card-aware conversations:** The front, back, deck and template, scheduling settings, and complete review log can be included in the assistant's context. Choose which fields to share before starting a conversation.
 - **Image input:** Local PNG, JPEG, GIF, and WebP images on the selected card sides can be sent to vision-capable models. Repeated images are attached only once.
-- **Message attachments:** Attach images, PDFs, and UTF-8 text/code files to a question. PDFs are supported in Responses, Claude, and Gemini modes.
+- **Message attachments:** Attach images, PDFs, and UTF-8 text/code files to a question with the plus button, drag-and-drop, or clipboard paste. Pasted file URLs/paths are detected and converted to attachments. PDFs are supported in Responses, Claude, and Gemini modes.
 - **Edit, copy, and regenerate:** User messages can be edited and resent. Assistant replies can be copied or regenerated; versions are kept as branches, and switching a branch also restores its follow-up conversation.
 - **Anki editing tools:** Ask the tutor to create, edit, or delete cards, or adjust a deck's shared review options. It proposes explicit changes and Anki asks for confirmation before applying them through native collection operations.
 - **Multiple conversations per card:** Switch discussions or start a new one using the controls above the chat. Saved conversations are covered when you return to a card; reveal or select a discussion to continue.

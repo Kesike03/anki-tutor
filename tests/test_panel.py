@@ -62,7 +62,8 @@ def load_panel():
         "QScrollArea", "QSizePolicy", "QStackedWidget", "QStyle", "QTextEdit",
         "QTimer", "QToolButton", "QUrl", "QVBoxLayout", "QWidget", "Qt",
         "QColor", "QPalette", "QTreeWidget", "QTreeWidgetItem", "QDialog",
-        "QFileDialog", "QInputDialog", "QListWidget", "QApplication",
+        "QFileDialog", "QInputDialog", "QListWidget", "QListWidgetItem", "QApplication",
+        "QBuffer", "QIODevice", "QImage",
     ):
         for source in (QtWidgets, QtCore, QtGui):
             if hasattr(source, name):
@@ -168,6 +169,74 @@ class PanelTests(unittest.TestCase):
                 self.panel._clear_chat()
             self.assertIsNone(self.panel.store.active(101))
             self.assertIsNone(self.panel.store.context(first_id))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_dragged_file_becomes_an_attachment(self):
+        self.panel.show_card(self.card(101))
+        image = QtGui.QImage(4, 4, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtGui.QColor("red"))
+        path = self.media / "drag.png"
+        self.assertTrue(image.save(str(path)))
+        mime = QtCore.QMimeData()
+        mime.setUrls([QtCore.QUrl.fromLocalFile(str(path))])
+        self.panel.composer.insertFromMimeData(mime)
+        self.assertEqual(len(self.panel.attachments), 1)
+        self.assertEqual(self.panel.attachments[0]["kind"], "image")
+        self.assertEqual(self.panel.attachments[0]["name"], "drag.png")
+
+    def test_attachment_removal_selects_and_deletes_the_right_file(self):
+        self.panel.show_card(self.card(101))
+        first = self.media / "first.png"
+        second = self.media / "second.png"
+        for path in (first, second):
+            path.write_bytes(b"image")
+        self.panel._attach_paths([str(first), str(second)])
+        self.assertEqual(self.panel.attachment_list.count(), 2)
+        self.assertEqual(self.panel.attachment_list.currentRow(), 1)
+        self.panel.attachment_list.setCurrentRow(0)
+        self.panel._remove_attachment()
+        self.assertEqual([item["name"] for item in self.panel.attachments], ["second.png"])
+        self.assertEqual(self.panel.attachment_list.currentRow(), 0)
+        self.panel.attachment_list.setCurrentRow(-1)
+        self.panel.remove_attachment_button.click()
+        self.assertEqual(self.panel.attachments, [])
+        self.assertFalse(self.panel.attachment_list.isVisible())
+
+    def test_action_response_is_dispatched(self):
+        captured = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                content = 'Done.\n```anki-actions\n{"actions":[{"type":"delete_card","card_id":1}]}\n```'
+                body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
+            self.panel.key_input.setText("test-key")
+            self.panel.show_card(self.card(101))
+            self.panel._confirm_actions = lambda actions, *_: captured.extend(actions)
+            self.panel.composer.setPlainText("Delete this card")
+            self.panel._send()
+            deadline = time.monotonic() + 5
+            while self.panel.pending and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(captured[0]["type"], "delete_card")
         finally:
             server.shutdown()
             server.server_close()

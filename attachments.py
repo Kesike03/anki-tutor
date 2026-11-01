@@ -2,7 +2,9 @@
 
 import base64
 import mimetypes
+import re
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
@@ -11,10 +13,37 @@ TEXT_SUFFIXES = {
     ".ts", ".css", ".java", ".rs", ".cpp", ".c", ".h", ".sql", ".yaml", ".yml",
 }
 MAX_BYTES = 20 * 1024 * 1024
+FILE_SUFFIXES = "|".join(
+    suffix.lstrip(".") for suffix in sorted(
+        {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", *TEXT_SUFFIXES}
+    )
+)
+FILE_URL = re.compile(r"file:///[^\s<>\"']+", re.IGNORECASE)
+WINDOWS_PATH = re.compile(
+    rf"(?<![\w])([A-Za-z]:\\(?:[^<>:\"|?*\r\n]+\\)*[^<>:\"|?*\r\n]*?\.(?:{FILE_SUFFIXES}))",
+    re.IGNORECASE,
+)
 
 
 class AttachmentError(ValueError):
     pass
+
+
+def local_file_references(text: str) -> tuple[str, list[str]]:
+    paths = []
+    cleaned = text
+    for match in FILE_URL.finditer(text):
+        source = unquote(urlsplit(match.group(0)).path).lstrip("/")
+        path = Path(source)
+        if path.is_file():
+            paths.append(str(path))
+            cleaned = cleaned.replace(match.group(0), " ")
+    for match in list(WINDOWS_PATH.finditer(cleaned)):
+        path = Path(match.group(1))
+        if path.is_file():
+            paths.append(str(path))
+            cleaned = cleaned.replace(match.group(1), " ")
+    return " ".join(cleaned.split()), paths
 
 
 def load_files(paths: list[str], existing: list[dict] | None = None) -> list[dict]:
