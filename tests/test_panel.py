@@ -205,13 +205,17 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(self.panel.attachments, [])
         self.assertFalse(self.panel.attachment_list.isVisible())
 
-    def test_action_response_is_dispatched(self):
+    def test_action_response_is_dispatched_and_followed_up(self):
         captured = []
+        requests = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                content = 'Done.\n```anki-actions\n{"actions":[{"type":"delete_card","card_id":1}]}\n```'
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                if len(requests) == 1:
+                    content = 'Done.\n```anki-actions\n{"actions":[{"type":"delete_card","card_id":1}]}\n```\nThe action is waiting for your confirmation.'
+                else:
+                    content = "The requested change is complete."
                 body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -229,7 +233,8 @@ class PanelTests(unittest.TestCase):
             self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
             self.panel.key_input.setText("test-key")
             self.panel.show_card(self.card(101))
-            self.panel._confirm_actions = lambda actions, *_: captured.extend(actions)
+            self.panel._ask_action_approval = lambda actions, *_: True
+            self.panel._execute_actions = lambda actions, *_: captured.extend(actions) or "1. delete_card: applied"
             self.panel.composer.setPlainText("Delete this card")
             self.panel._send()
             deadline = time.monotonic() + 5
@@ -237,6 +242,12 @@ class PanelTests(unittest.TestCase):
                 self.app.processEvents()
                 time.sleep(0.01)
             self.assertEqual(captured[0]["type"], "delete_card")
+            self.assertEqual(len(requests), 2)
+            final = self.panel.store.messages(self.panel.conversation_id)[-1]["content"]
+            self.assertEqual(final, "The requested change is complete.")
+            instructions = requests[0]["messages"][0]["content"]
+            self.assertIn("Hidden user settings:", instructions)
+            self.assertIn("USER_CONFIRMATION_REQUIRED", instructions)
         finally:
             server.shutdown()
             server.server_close()

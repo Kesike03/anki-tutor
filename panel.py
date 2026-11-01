@@ -45,7 +45,7 @@ from aqt.webview import AnkiWebView
 
 from .context import SYSTEM_PROMPT, ImageContextError, build_system_prompt, collect_card_images
 from .attachments import AttachmentError, load_files, local_file_references
-from .harness import describe, execute, extract_plan, instructions_for
+from .harness import describe, execute, extract_plan, extract_queries, instructions_for, run_queries
 from .i18n import LANGUAGES, tr
 from .protocols import DEFAULTS, ProtocolError, build_request, parse_response, provider_error
 from .history import HistoryDialog
@@ -112,14 +112,21 @@ class Composer(QTextEdit):
         super().dropEvent(event)
 
 
+MAX_AGENT_ROUNDS = 6
+
+
 @dataclass
 class PendingRequest:
-    reply: QNetworkReply
+    reply: QNetworkReply | None
     mode: str
     api_key: str
     user_id: int
     card_id: int
     deck_name: str
+    messages: list[dict]
+    system_prompt: str
+    images: list[dict]
+    rounds: int = 0
 
 
 class TutorPanel(QDockWidget):
@@ -327,6 +334,11 @@ class TutorPanel(QDockWidget):
             check.setChecked(self.config.get(f"context_{key}", True))
             settings_layout.addWidget(check)
             self.checks[key] = check
+        settings_layout.addSpacing(8)
+        self.auto_approve_check = QCheckBox()
+        self.auto_approve_check.setChecked(self.config.get("auto_approve_actions", False))
+        self.auto_approve_check.toggled.connect(self._save_settings)
+        settings_layout.addWidget(self.auto_approve_check)
         self.settings_scroll.setWidget(settings_content)
         layout.addWidget(self.settings_scroll)
 
@@ -482,6 +494,8 @@ class TutorPanel(QDockWidget):
         self.reset_prompt_button.setText(self.text("reset_prompt"))
         for name, checkbox in self.checks.items():
             checkbox.setText(self.text(name))
+        self.auto_approve_check.setText(self.text("auto_approve"))
+        self.auto_approve_check.setToolTip(self.text("auto_approve_tip"))
         self.empty_label.setText(self.text("empty" if self.card is None else "new_chat"))
         self.cover_label.setText(self.text("old_chat"))
         self.reveal_button.setText(self.text("reveal"))
@@ -553,6 +567,7 @@ class TutorPanel(QDockWidget):
         )
         for name, check in self.checks.items():
             self.config[f"context_{name}"] = check.isChecked()
+        self.config["auto_approve_actions"] = self.auto_approve_check.isChecked()
         self.mw.addonManager.writeConfig(__name__, self.config)
 
     def open_profile(self) -> None:
@@ -944,8 +959,9 @@ class TutorPanel(QDockWidget):
             self.store.history_until(conversation_id, target_user_id)
             if target_user_id is not None else self.store.messages(conversation_id)
         )
-        if target_user_id is not None and history[-1]["role"] != "user":
-            return
+        if target_user_id is not None:
+            if not history or history[-1]["role"] != "user":
+                return
         if new_message is not None:
             history.append({"role": "user", "content": new_message, "attachments": attachments or []})
         try:
@@ -955,7 +971,8 @@ class TutorPanel(QDockWidget):
                 images = collect_card_images(self.card, self.mw.col, self.config)
             else:
                 prompt, images = saved_context
-            spec = build_request(self.config, prompt + "\n\n" + instructions_for(self.card, self.mw.col), history, images)
+            system_prompt = prompt + "\n\n" + instructions_for(self.card, self.mw.col, self.config)
+            build_request(self.config, system_prompt, history, images)
         except (ProtocolError, ImageContextError) as error:
             key = str(error)
             self.errors[conversation_id] = self.text(key) if key in ("missing_key", "missing_model", "invalid_host", "invalid_path", "invalid_response", "image_error", "pdf_not_supported") else key
@@ -979,16 +996,14 @@ class TutorPanel(QDockWidget):
             self.attachment_drafts.pop(self._draft_key(), None)
             self._refresh_attachments()
             self.drafts.pop(self._draft_key(), None)
-        request = QNetworkRequest(QUrl(spec.url))
-        request.setTransferTimeout(90000)
-        for name, value in spec.headers.items():
-            request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
-        reply = self.network.post(request, json.dumps(spec.body, ensure_ascii=False).encode("utf-8"))
-        self.pending[conversation_id] = PendingRequest(
-            reply, self.config["api_mode"], self.config["api_key"], target_user_id,
+        if target_user_id is None:
+            return
+        pending = PendingRequest(
+            None, self.config["api_mode"], self.config["api_key"], target_user_id,
             self.card.id, self.mw.col.decks.name(self.card.current_deck_id()),
+            history, system_prompt, images,
         )
-        reply.finished.connect(lambda: self._on_reply(conversation_id, reply))
+        self.pending[conversation_id] = pending
         self.errors.pop(conversation_id, None)
         self.covered = False
         self.settings_button.setChecked(False)
@@ -996,10 +1011,44 @@ class TutorPanel(QDockWidget):
         self._refresh_conversations()
         self._refresh()
         self._render_messages()
+        if not self._post_pending(conversation_id, pending):
+            return
+
+    def _post_pending(self, conversation_id: int, pending: PendingRequest) -> bool:
+        try:
+            spec = build_request(
+                self.config, pending.system_prompt, pending.messages, pending.images
+            )
+        except (ProtocolError, ImageContextError) as error:
+            self.pending.pop(conversation_id, None)
+            key = str(error)
+            self.errors[conversation_id] = self.text(key) if key in (
+                "missing_key", "missing_model", "invalid_host", "invalid_path",
+                "invalid_response", "image_error", "pdf_not_supported",
+            ) else key
+            if key in ("missing_key", "missing_model"):
+                self.settings_button.setChecked(True)
+                self._toggle_settings(True)
+            self._refresh()
+            return False
+        except Exception:
+            traceback.print_exc()
+            self.pending.pop(conversation_id, None)
+            self.errors[conversation_id] = self.text("context_error")
+            self._refresh()
+            return False
+        request = QNetworkRequest(QUrl(spec.url))
+        request.setTransferTimeout(90000)
+        for name, value in spec.headers.items():
+            request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
+        reply = self.network.post(request, json.dumps(spec.body, ensure_ascii=False).encode("utf-8"))
+        pending.reply = reply
+        reply.finished.connect(lambda: self._on_reply(conversation_id, reply))
+        return True
 
     def _cancel_request(self, conversation_id: int) -> None:
         pending = self.pending.pop(conversation_id, None)
-        if pending is not None:
+        if pending is not None and pending.reply is not None:
             pending.reply.abort()
 
     def _on_reply(self, conversation_id: int, reply: QNetworkReply) -> None:
@@ -1007,12 +1056,13 @@ class TutorPanel(QDockWidget):
         reply.deleteLater()
         if pending is None or pending.reply is not reply or self.store is None:
             return
-        del self.pending[conversation_id]
+        pending.reply = None
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         try:
             data = json.loads(bytes(reply.readAll()).decode("utf-8"))
         except (UnicodeError, ValueError):
             data = None
+        error = ""
         if status is not None and int(status) >= 300:
             error = provider_error(int(status), data)
         elif reply.error() == QNetworkReply.NetworkError.TimeoutError:
@@ -1024,46 +1074,113 @@ class TutorPanel(QDockWidget):
                 answer = parse_response(pending.mode, data)
             except ProtocolError as exception:
                 error = self.text(str(exception))
-            else:
-                error = ""
-                actions = None
-                try:
-                    answer, actions = extract_plan(answer)
-                except ValueError as exception:
-                    error = str(exception)
-                visible = {message["id"] for message in self.store.messages(conversation_id)}
-                assistant_id = self.store.append_branch(
-                    conversation_id, pending.user_id, "assistant", answer or self.text("action_confirm"),
-                    select=pending.user_id in visible,
-                )
         if error:
-            for key in (pending.api_key, self.config.get("api_key", "")):
-                if key:
-                    error = error.replace(key, "[redacted]")
-            self.errors[conversation_id] = f"{self.text('failed')}: {error}"
-        else:
-            self.errors.pop(conversation_id, None)
+            self.pending.pop(conversation_id, None)
+            self._show_pending_error(conversation_id, pending, error)
+            return
+        self._handle_agent_reply(conversation_id, pending, answer)
+
+    def _show_pending_error(self, conversation_id: int, pending: PendingRequest, error: str) -> None:
+        for key in (pending.api_key, self.config.get("api_key", "")):
+            if key:
+                error = error.replace(key, "[redacted]")
+        self.errors[conversation_id] = f"{self.text('failed')}: {error}"
+        if self.conversation_id == conversation_id:
+            self._refresh()
+            self._render_messages()
+
+    def _handle_agent_reply(
+        self, conversation_id: int, pending: PendingRequest, raw: str
+    ) -> None:
+        if self.store is None:
+            return
+        try:
+            visible, queries = extract_queries(raw)
+        except ValueError as error:
+            self.pending.pop(conversation_id, None)
+            self._show_pending_error(conversation_id, pending, str(error))
+            return
+        if queries:
+            if pending.rounds >= MAX_AGENT_ROUNDS:
+                self._finish_pending(conversation_id, pending, visible, "agent_limit")
+                return
+            pending.rounds += 1
+            results = run_queries(
+                self.mw.col, queries, pending.card_id, pending.deck_name
+            )
+            pending.messages.extend([
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content":
+                    "Anki query results:\n" + results +
+                    "\n\nContinue the task. Use another query or anki-actions block if needed; "
+                    "otherwise give the final answer."},
+            ])
+            self._show_agent_progress(conversation_id)
+            self._post_pending(conversation_id, pending)
+            return
+        try:
+            visible, actions = extract_plan(raw)
+        except ValueError as error:
+            self.pending.pop(conversation_id, None)
+            self._show_pending_error(conversation_id, pending, str(error))
+            return
+        if actions:
+            if pending.rounds >= MAX_AGENT_ROUNDS:
+                self._finish_pending(conversation_id, pending, visible, "agent_limit")
+                return
+            pending.rounds += 1
+            approved = self.config.get("auto_approve_actions", False) or self._ask_action_approval(
+                actions, pending.card_id, pending.deck_name
+            )
+            if not approved:
+                self._finish_pending(
+                    conversation_id, pending,
+                    (visible + "\n\n" + self.text("action_cancelled")).strip(),
+                )
+                return
+            results = self._execute_actions(actions, pending.card_id, pending.deck_name)
+            pending.messages.extend([
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content":
+                    "Anki action results:\n" + results +
+                    "\n\nReview whether the user's request is fully complete and correct. "
+                    "If more work is needed, use another query/action block; otherwise give "
+                    "a concise final answer. Do not repeat actions that already succeeded."},
+            ])
+            self._show_agent_progress(conversation_id)
+            self._post_pending(conversation_id, pending)
+            return
+        self._finish_pending(conversation_id, pending, visible)
+
+    def _show_agent_progress(self, conversation_id: int) -> None:
+        if self.conversation_id == conversation_id:
+            self._refresh()
+            self._render_messages()
+
+    def _finish_pending(
+        self, conversation_id: int, pending: PendingRequest,
+        visible: str, fallback: str = "action_success",
+    ) -> None:
+        self.pending.pop(conversation_id, None)
+        if self.store is None:
+            return
+        text = (visible or "").strip() or self.text(fallback)
+        visible_ids = {message["id"] for message in self.store.messages(conversation_id)}
+        self.store.append_branch(
+            conversation_id, pending.user_id, "assistant", text,
+            select=pending.user_id in visible_ids,
+        )
+        self.errors.pop(conversation_id, None)
         if self.conversation_id == conversation_id:
             self._refresh_conversations()
             self._refresh()
             self._render_messages()
-        if not error and actions:
-            self._confirm_actions(actions, pending.card_id, pending.deck_name, conversation_id, assistant_id)
 
-    def _record_action_status(self, conversation_id: int, assistant_id: int, status: str) -> None:
-        if self.store is None:
-            return
-        try:
-            self.store.append_status(conversation_id, assistant_id, status)
-        except ValueError:
-            return
-        if self.conversation_id == conversation_id:
-            self._render_messages()
-
-    def _confirm_actions(
-        self, actions: list[dict], card_id: int, deck_name: str,
-        conversation_id: int, assistant_id: int,
-    ) -> None:
+    def _ask_action_approval(
+        self, actions: list[dict], card_id: int, deck_name: str
+    ) -> bool:
+        if self.config.get("auto_approve_actions", False):
+            return True
         box = QMessageBox(self.mw)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(self.text("title"))
@@ -1075,33 +1192,23 @@ class TutorPanel(QDockWidget):
         box.setText(self.text("action_confirm") + "\n\n" + details)
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
-        if box.exec() == QMessageBox.StandardButton.Yes:
-            self._run_actions(actions, card_id, deck_name, conversation_id, assistant_id)
-        else:
-            self._record_action_status(conversation_id, assistant_id, self.text("action_cancelled"))
+        return box.exec() == QMessageBox.StandardButton.Yes
 
-    def _run_actions(
-        self, actions: list[dict], card_id: int, deck_name: str,
-        conversation_id: int, assistant_id: int,
-    ) -> None:
-        from aqt.operations import CollectionOp
-        from aqt.utils import tooltip
-
-        if not actions:
-            self._record_action_status(conversation_id, assistant_id, self.text("action_success"))
-            tooltip(self.text("action_success"), parent=self.mw)
-            return
-        action = actions[0]
-        CollectionOp(self.mw, lambda col: execute(col, action, card_id, deck_name)).success(
-            lambda _result: self._run_actions(actions[1:], card_id, deck_name, conversation_id, assistant_id)
-        ).failure(
-            lambda error: (
-                self._record_action_status(conversation_id, assistant_id, f"{self.text('action_failure')}: {error}"),
-                QMessageBox.warning(
-                    self.mw, self.text("action_failure"), f"{self.text('action_failure')}: {error}"
-                ),
-            )
-        ).run_in_background()
+    def _execute_actions(
+        self, actions: list[dict], card_id: int, deck_name: str
+    ) -> str:
+        results = []
+        for index, action in enumerate(actions, 1):
+            try:
+                execute(self.mw.col, action, card_id, deck_name)
+                results.append(f"{index}. {action['type']}: applied")
+            except Exception as error:
+                results.append(f"{index}. {action['type']}: failed: {error}")
+        try:
+            self.mw.reset()
+        except Exception:
+            traceback.print_exc()
+        return "\n".join(results)
 
     def _apply_theme(self) -> None:
         palette = self.mw.app.palette()

@@ -11,5 +11,6 @@
   "context_images": true,
   "context_deck": true,
   "context_schedule": true,
-  "context_history": true
+  "context_history": true,
+  "auto_approve_actions": false
 }
