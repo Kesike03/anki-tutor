@@ -8,14 +8,18 @@ from pathlib import Path
 import anki.lang
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from aqt.qt import (
+    QApplication,
     QCheckBox,
     QColor,
     QComboBox,
     QDockWidget,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPalette,
     QPlainTextEdit,
@@ -36,6 +40,8 @@ from aqt.theme import theme_manager
 from aqt.webview import AnkiWebView
 
 from .context import SYSTEM_PROMPT, ImageContextError, build_system_prompt, collect_card_images
+from .attachments import AttachmentError, load_files
+from .harness import INSTRUCTIONS, describe, execute, extract_plan
 from .i18n import LANGUAGES, tr
 from .protocols import DEFAULTS, ProtocolError, build_request, parse_response, provider_error
 from .history import HistoryDialog
@@ -66,6 +72,9 @@ class PendingRequest:
     reply: QNetworkReply
     mode: str
     api_key: str
+    user_id: int
+    card_id: int
+    deck_name: str
 
 
 class TutorPanel(QDockWidget):
@@ -85,6 +94,8 @@ class TutorPanel(QDockWidget):
         self.conversation_id = None
         self.covered = False
         self.drafts: dict[tuple[int, int | None], str] = {}
+        self.attachment_drafts: dict[tuple[int, int | None], list[dict]] = {}
+        self.attachments: list[dict] = []
         self.errors: dict[int, str] = {}
         self.pending: dict[int, PendingRequest] = {}
         self.network = QNetworkAccessManager(self)
@@ -305,6 +316,7 @@ class TutorPanel(QDockWidget):
         self.chat_web = AnkiWebView(parent=self)
         self.chat_web.setObjectName("tutorChatWeb")
         self.chat_web.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.chat_web.set_bridge_command(self._chat_command, self)
         self.chat_web.stdHtml(
             '<div id="thread"></div>',
             css=["/_addons/anki_tutor/web/chat.css"],
@@ -333,20 +345,39 @@ class TutorPanel(QDockWidget):
 
         footer = QFrame()
         footer.setObjectName("tutorFooter")
-        footer_layout = QHBoxLayout(footer)
+        footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(12, 10, 12, 12)
-        footer_layout.setSpacing(8)
+        footer_layout.setSpacing(5)
+        attachment_row = QHBoxLayout()
+        self.attachment_list = QListWidget()
+        self.attachment_list.setFixedHeight(55)
+        self.attachment_list.hide()
+        attachment_row.addWidget(self.attachment_list, 1)
+        self.remove_attachment_button = QToolButton()
+        self.remove_attachment_button.setIcon(self._icon(QStyle.StandardPixmap.SP_DialogDiscardButton))
+        self.remove_attachment_button.clicked.connect(self._remove_attachment)
+        self.remove_attachment_button.hide()
+        attachment_row.addWidget(self.remove_attachment_button)
+        footer_layout.addLayout(attachment_row)
+        composer_row = QHBoxLayout()
+        composer_row.setSpacing(8)
         self.composer = Composer(self._send)
         self.composer.setObjectName("tutorComposer")
         self.composer.setMinimumHeight(64)
         self.composer.setMaximumHeight(112)
         self.composer.textChanged.connect(self._update_send_button)
-        footer_layout.addWidget(self.composer, 1)
+        composer_row.addWidget(self.composer, 1)
+        self.attach_button = QToolButton()
+        self.attach_button.setText("+")
+        self.attach_button.setObjectName("tutorTool")
+        self.attach_button.clicked.connect(self._choose_attachments)
+        composer_row.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         self.send_button = QToolButton()
         self.send_button.setObjectName("tutorSend")
         self.send_button.setIcon(self._icon(QStyle.StandardPixmap.SP_ArrowForward))
         self.send_button.clicked.connect(self._send)
-        footer_layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignBottom)
+        composer_row.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignBottom)
+        footer_layout.addLayout(composer_row)
         layout.addWidget(footer)
         self.setWidget(root)
 
@@ -412,6 +443,9 @@ class TutorPanel(QDockWidget):
         self.composer.setToolTip(self.text("input_tip"))
         self.send_button.setToolTip(self.text("send"))
         self.send_button.setAccessibleName(self.text("send"))
+        self.attach_button.setToolTip(self.text("attach"))
+        self.attach_button.setAccessibleName(self.text("attach"))
+        self.remove_attachment_button.setToolTip(self.text("remove_attachment"))
         if self.history_dialog is not None:
             self.history_dialog.refresh()
         self._refresh()
@@ -491,6 +525,8 @@ class TutorPanel(QDockWidget):
             self.store.close()
             self.store = None
         self.drafts.clear()
+        self.attachment_drafts.clear()
+        self.attachments.clear()
         self.errors.clear()
         if self.history_dialog is not None:
             self.history_dialog.close()
@@ -500,13 +536,47 @@ class TutorPanel(QDockWidget):
     def _draft_key(self) -> tuple[int, int | None]:
         return self.card.id, self.conversation_id
 
-    def leave_review(self) -> None:
+    def _save_draft(self) -> None:
         if self.card is not None:
             self.drafts[self._draft_key()] = self.composer.toPlainText()
+            self.attachment_drafts[self._draft_key()] = list(self.attachments)
+
+    def _load_draft(self) -> None:
+        self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self.attachments = list(self.attachment_drafts.get(self._draft_key(), []))
+        self._refresh_attachments()
+
+    def _refresh_attachments(self) -> None:
+        self.attachment_list.clear()
+        self.attachment_list.addItems([item["name"] for item in self.attachments])
+        self.attachment_list.setVisible(bool(self.attachments))
+        self.remove_attachment_button.setVisible(bool(self.attachments))
+        self._update_send_button()
+
+    def _choose_attachments(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, self.text("attach"))
+        if not paths:
+            return
+        try:
+            self.attachments = load_files(paths, self.attachments)
+        except (AttachmentError, OSError) as error:
+            QMessageBox.warning(self, self.text("attach"), f"{self.text('attachment_error')}: {error}")
+        self._refresh_attachments()
+
+    def _remove_attachment(self) -> None:
+        index = self.attachment_list.currentRow()
+        if index >= 0:
+            self.attachments.pop(index)
+            self._refresh_attachments()
+
+    def leave_review(self) -> None:
+        self._save_draft()
         self.card = None
         self.conversation_id = None
         self.covered = False
         self.composer.clear()
+        self.attachments = []
+        self._refresh_attachments()
         self._refresh()
 
     def show_card(self, card) -> None:
@@ -516,12 +586,11 @@ class TutorPanel(QDockWidget):
             self.card = card
             self._refresh()
             return
-        if self.card is not None:
-            self.drafts[self._draft_key()] = self.composer.toPlainText()
+        self._save_draft()
         self.card = card
         self.store.update_card(card.id, self._card_label(card), self.mw.col.decks.name(card.current_deck_id()))
         self.conversation_id = self.store.active(card.id)
-        self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self._load_draft()
         self.covered = bool(self.conversation_id and self.store.messages(self.conversation_id))
         self._refresh_conversations()
         self._refresh()
@@ -555,10 +624,10 @@ class TutorPanel(QDockWidget):
         conversation_id = self.conversation_combo.itemData(index)
         if conversation_id == self.conversation_id:
             return
-        self.drafts[self._draft_key()] = self.composer.toPlainText()
+        self._save_draft()
         self.conversation_id = conversation_id
         self.store.select(self.card.id, conversation_id)
-        self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+        self._load_draft()
         self.covered = False
         self._refresh()
         self._render_messages()
@@ -570,14 +639,18 @@ class TutorPanel(QDockWidget):
             self.composer.setFocus()
             return
         initial_draft = self.composer.toPlainText() if self.conversation_id is None else ""
-        self.drafts[self._draft_key()] = self.composer.toPlainText()
+        initial_attachments = list(self.attachments) if self.conversation_id is None else []
+        self._save_draft()
         if self.conversation_id is None:
             self.drafts.pop(self._draft_key(), None)
+            self.attachment_drafts.pop(self._draft_key(), None)
         self.conversation_id = self.store.create(
             self.card.id, self._card_label(self.card),
             self.mw.col.decks.name(self.card.current_deck_id()),
         )
         self.composer.setPlainText(initial_draft)
+        self.attachments = initial_attachments
+        self._refresh_attachments()
         self.covered = False
         self._refresh_conversations()
         self._refresh()
@@ -598,9 +671,9 @@ class TutorPanel(QDockWidget):
             return
         self.store.select(card_id, conversation_id)
         if self.card is not None and self.card.id == card_id:
-            self.drafts[self._draft_key()] = self.composer.toPlainText()
+            self._save_draft()
             self.conversation_id = conversation_id
-            self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+            self._load_draft()
             self.covered = False
             self._refresh_conversations()
             self._refresh()
@@ -614,11 +687,12 @@ class TutorPanel(QDockWidget):
             for key in list(self.drafts):
                 if key[1] == conversation_id:
                     del self.drafts[key]
+                    self.attachment_drafts.pop(key, None)
         if self.card is not None and self.store is not None:
             self.conversation_id = self.store.active(self.card.id)
             if self.conversation_id != previous_id:
                 self.covered = bool(self.conversation_id and self.store.messages(self.conversation_id))
-                self.composer.setPlainText(self.drafts.get(self._draft_key(), ""))
+                self._load_draft()
         self._refresh_conversations()
         self._refresh()
         self._render_messages()
@@ -632,6 +706,7 @@ class TutorPanel(QDockWidget):
         self.conversation_combo.setEnabled(available and self.conversation_id is not None)
         self.clear_button.setEnabled(available and self.conversation_id is not None)
         self.composer.setEnabled(available)
+        self.attach_button.setEnabled(available)
         self._update_send_button()
         self.empty_label.setText(self.text("new_chat" if available else "empty"))
         if not available:
@@ -657,7 +732,7 @@ class TutorPanel(QDockWidget):
             self.card is not None
             and self.store is not None
             and self.conversation_id not in self.pending
-            and bool(self.composer.toPlainText().strip())
+            and bool(self.composer.toPlainText().strip() or self.attachments)
         )
 
     def _reveal(self) -> None:
@@ -670,6 +745,12 @@ class TutorPanel(QDockWidget):
             self.store.messages(self.conversation_id)
             if self.store is not None and self.conversation_id is not None and not self.covered else []
         )
+        messages = [
+            {**message, "attachments": [
+                {"name": attachment["name"], "kind": attachment["kind"]}
+                for attachment in message.get("attachments", [])
+            ]} for message in messages
+        ]
         if self.conversation_id in self.pending and not self.covered:
             messages.append({"role": "assistant", "content": self.text("thinking")})
         palette = self.mw.app.palette()
@@ -681,8 +762,46 @@ class TutorPanel(QDockWidget):
             "border": palette.color(QPalette.ColorRole.Mid).name(),
             "user": self._user_color(),
         }
-        payload = {"messages": messages, "you": self.text("you"), "tutor": self.text("tutor"), "theme": theme}
+        payload = {
+            "messages": messages, "you": self.text("you"), "tutor": self.text("tutor"),
+            "labels": {key: self.text(key) for key in (
+                "copy", "regenerate", "edit_message", "previous_branch", "next_branch"
+            )},
+            "busy": self.conversation_id in self.pending, "theme": theme,
+        }
         self.chat_web.eval(f"window.renderTutorMessages({json.dumps(payload, ensure_ascii=False)});")
+
+    def _chat_command(self, command: str) -> None:
+        if not command.startswith("tutor:") or self.store is None or self.conversation_id is None or self.covered:
+            return
+        try:
+            _, action, value = command.split(":", 2)
+            message_id = int(value)
+            if message_id not in {message["id"] for message in self.store.messages(self.conversation_id)}:
+                return
+            message = self.store.message(self.conversation_id, message_id)
+        except (ValueError, KeyError):
+            return
+        if action == "copy" and message["role"] == "assistant":
+            QApplication.clipboard().setText(message["content"])
+        elif self.conversation_id not in self.pending:
+            if action in ("prev", "next"):
+                if self.store.adjacent_branch(self.conversation_id, message_id, -1 if action == "prev" else 1):
+                    self._refresh()
+                    self._render_messages()
+            elif action == "regen" and message["role"] == "assistant":
+                parent = self.store.message(self.conversation_id, message["parent_id"])
+                if parent["role"] == "user":
+                    self._request(None, target_user_id=parent["id"])
+            elif action == "edit" and message["role"] == "user":
+                content, accepted = QInputDialog.getMultiLineText(
+                    self, self.text("edit_message"), self.text("edit_message"), message["content"]
+                )
+                if accepted and (content.strip() or message["attachments"]):
+                    edited_id = self.store.fork_user(self.conversation_id, message_id, content.strip())
+                    self._refresh()
+                    self._render_messages()
+                    self._request(None, target_user_id=edited_id)
 
     def _user_color(self) -> str:
         palette = self.mw.app.palette()
@@ -707,25 +826,35 @@ class TutorPanel(QDockWidget):
         if self.card is None or self.store is None or self.conversation_id in self.pending:
             return
         message = self.composer.toPlainText().strip()
-        if not message:
+        if not message and not self.attachments:
             return
-        self._request(message)
+        self._request(message or self.text("attachment_only"), attachments=list(self.attachments))
 
     def _retry(self) -> None:
         if self.card is None or self.store is None or self.conversation_id is None or self.conversation_id in self.pending:
             return
         history = self.store.messages(self.conversation_id)
         if history and history[-1]["role"] == "user":
-            self._request(None)
+            self._request(None, target_user_id=history[-1]["id"])
 
-    def _request(self, new_message: str | None) -> None:
+    def _request(
+        self, new_message: str | None, attachments: list[dict] | None = None,
+        target_user_id: int | None = None,
+    ) -> None:
         self._save_settings()
+        if self.conversation_id in self.pending:
+            return
         if self.conversation_id is None:
             self._new_conversation()
         conversation_id = self.conversation_id
-        history = self.store.messages(conversation_id)
+        history = (
+            self.store.history_until(conversation_id, target_user_id)
+            if target_user_id is not None else self.store.messages(conversation_id)
+        )
+        if target_user_id is not None and history[-1]["role"] != "user":
+            return
         if new_message is not None:
-            history.append({"role": "user", "content": new_message})
+            history.append({"role": "user", "content": new_message, "attachments": attachments or []})
         try:
             saved_context = self.store.context(conversation_id)
             if saved_context is None:
@@ -733,9 +862,10 @@ class TutorPanel(QDockWidget):
                 images = collect_card_images(self.card, self.mw.col, self.config)
             else:
                 prompt, images = saved_context
-            spec = build_request(self.config, prompt, history, images)
+            spec = build_request(self.config, prompt + "\n\n" + INSTRUCTIONS, history, images)
         except (ProtocolError, ImageContextError) as error:
-            self.errors[conversation_id] = self.text(str(error))
+            key = str(error)
+            self.errors[conversation_id] = self.text(key) if key in ("missing_key", "missing_model", "invalid_host", "invalid_path", "invalid_response", "image_error", "pdf_not_supported") else key
             self._refresh()
             if str(error) in ("missing_key", "missing_model"):
                 self.settings_button.setChecked(True)
@@ -747,17 +877,25 @@ class TutorPanel(QDockWidget):
             self._refresh()
             return
 
+        if new_message is not None:
+            target_user_id = self.store.add_user_message(
+                conversation_id, new_message, prompt, images, attachments
+            )
+            self.composer.clear()
+            self.attachments.clear()
+            self.attachment_drafts.pop(self._draft_key(), None)
+            self._refresh_attachments()
+            self.drafts.pop(self._draft_key(), None)
         request = QNetworkRequest(QUrl(spec.url))
         request.setTransferTimeout(90000)
         for name, value in spec.headers.items():
             request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
         reply = self.network.post(request, json.dumps(spec.body, ensure_ascii=False).encode("utf-8"))
-        self.pending[conversation_id] = PendingRequest(reply, self.config["api_mode"], self.config["api_key"])
+        self.pending[conversation_id] = PendingRequest(
+            reply, self.config["api_mode"], self.config["api_key"], target_user_id,
+            self.card.id, self.mw.col.decks.name(self.card.current_deck_id()),
+        )
         reply.finished.connect(lambda: self._on_reply(conversation_id, reply))
-        if new_message is not None:
-            self.store.add_user_message(conversation_id, new_message, prompt, images)
-            self.composer.clear()
-            self.drafts.pop(self._draft_key(), None)
         self.errors.pop(conversation_id, None)
         self.covered = False
         self.settings_button.setChecked(False)
@@ -795,7 +933,16 @@ class TutorPanel(QDockWidget):
                 error = self.text(str(exception))
             else:
                 error = ""
-                self.store.append(conversation_id, "assistant", answer)
+                actions = None
+                try:
+                    answer, actions = extract_plan(answer)
+                except ValueError as exception:
+                    error = str(exception)
+                visible = {message["id"] for message in self.store.messages(conversation_id)}
+                assistant_id = self.store.append_branch(
+                    conversation_id, pending.user_id, "assistant", answer or self.text("action_confirm"),
+                    select=pending.user_id in visible,
+                )
         if error:
             for key in (pending.api_key, self.config.get("api_key", "")):
                 if key:
@@ -807,6 +954,61 @@ class TutorPanel(QDockWidget):
             self._refresh_conversations()
             self._refresh()
             self._render_messages()
+        if not error and actions:
+            self._confirm_actions(actions, pending.card_id, pending.deck_name, conversation_id, assistant_id)
+
+    def _record_action_status(self, conversation_id: int, assistant_id: int, status: str) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.append_status(conversation_id, assistant_id, status)
+        except ValueError:
+            return
+        if self.conversation_id == conversation_id:
+            self._render_messages()
+
+    def _confirm_actions(
+        self, actions: list[dict], card_id: int, deck_name: str,
+        conversation_id: int, assistant_id: int,
+    ) -> None:
+        box = QMessageBox(self.mw)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(self.text("title"))
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        details = "\n".join(
+            f"{index}. {describe(action, card_id, deck_name)}"
+            for index, action in enumerate(actions, 1)
+        )
+        box.setText(self.text("action_confirm") + "\n\n" + details)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self._run_actions(actions, card_id, deck_name, conversation_id, assistant_id)
+        else:
+            self._record_action_status(conversation_id, assistant_id, self.text("action_cancelled"))
+
+    def _run_actions(
+        self, actions: list[dict], card_id: int, deck_name: str,
+        conversation_id: int, assistant_id: int,
+    ) -> None:
+        from aqt.operations import CollectionOp
+        from aqt.utils import tooltip
+
+        if not actions:
+            self._record_action_status(conversation_id, assistant_id, self.text("action_success"))
+            tooltip(self.text("action_success"), parent=self.mw)
+            return
+        action = actions[0]
+        CollectionOp(self.mw, lambda col: execute(col, action, card_id, deck_name)).success(
+            lambda _result: self._run_actions(actions[1:], card_id, deck_name, conversation_id, assistant_id)
+        ).failure(
+            lambda error: (
+                self._record_action_status(conversation_id, assistant_id, f"{self.text('action_failure')}: {error}"),
+                QMessageBox.warning(
+                    self.mw, self.text("action_failure"), f"{self.text('action_failure')}: {error}"
+                ),
+            )
+        ).run_in_background()
 
     def _apply_theme(self) -> None:
         palette = self.mw.app.palette()

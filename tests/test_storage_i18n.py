@@ -77,6 +77,37 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(store.list_conversations(), [])
             store.close()
 
+    def test_branches_restore_their_own_followups_and_attachments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory), "branch/collection.anki2")
+            conversation = store.create(17, "Front", "Deck")
+            attachment = [{"name": "note.txt", "kind": "text", "mime": "text/plain", "data": "aGVsbG8="}]
+            user = store.add_user_message(conversation, "Question", "Tutor", [], attachment)
+            answer_a = store.append_branch(conversation, user, "assistant", "Answer A")
+            store.append_branch(conversation, answer_a, "user", "Follow-up A")
+            answer_b = store.append_branch(conversation, user, "assistant", "Answer B")
+            store.append_branch(conversation, answer_b, "user", "Follow-up B")
+            self.assertEqual([row["content"] for row in store.messages(conversation)],
+                             ["Question", "Answer B", "Follow-up B"])
+            store.select_branch(conversation, answer_a)
+            self.assertEqual([row["content"] for row in store.messages(conversation)],
+                             ["Question", "Answer A", "Follow-up A"])
+            edited = store.fork_user(conversation, user, "Edited question")
+            store.append_branch(conversation, edited, "assistant", "New answer")
+            self.assertEqual(store.messages(conversation)[0]["attachments"], attachment)
+            self.assertEqual(store.messages(conversation)[-1]["content"], "New answer")
+            backup = store.export_data()
+            store.delete_all()
+            self.assertEqual(store.import_data(backup), (1, 0))
+            restored = store.active(17)
+            self.assertEqual(store.messages(restored)[-1]["content"], "New answer")
+            original_user = store.messages(restored)[0]
+            store.select_branch(restored, store.connection.execute(
+                "SELECT id FROM chat_messages WHERE conversation_id = ? AND content = 'Question'", (restored,)
+            ).fetchone()[0])
+            self.assertEqual(store.messages(restored)[0]["content"], "Question")
+            store.close()
+
     def test_translations_have_every_interface_key(self):
         reference = set(STRINGS["en"])
         self.assertEqual(len(LANGUAGES), 6)

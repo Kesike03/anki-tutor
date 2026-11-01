@@ -53,6 +53,36 @@ class ConversationStore:
             if self.connection.execute("PRAGMA user_version").fetchone()[0] < 2:
                 self._migrate_legacy()
                 self.connection.execute("PRAGMA user_version = 2")
+            if self.connection.execute("PRAGMA user_version").fetchone()[0] < 3:
+                self._migrate_branches()
+                self.connection.execute("PRAGMA user_version = 3")
+
+    def _migrate_branches(self) -> None:
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(chat_messages)")}
+        if "parent_id" not in columns:
+            self.connection.execute("ALTER TABLE chat_messages ADD COLUMN parent_id INTEGER")
+        if "attachments_json" not in columns:
+            self.connection.execute(
+                "ALTER TABLE chat_messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS branch_selection (
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                parent_id INTEGER NOT NULL,
+                child_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                PRIMARY KEY(conversation_id, parent_id)
+            )"""
+        )
+        for (conversation_id,) in self.connection.execute("SELECT id FROM conversations").fetchall():
+            parent = 0
+            for (message_id,) in self.connection.execute(
+                "SELECT id FROM chat_messages WHERE conversation_id = ? ORDER BY id", (conversation_id,)
+            ).fetchall():
+                self.connection.execute(
+                    "UPDATE chat_messages SET parent_id = ? WHERE id = ?", (parent, message_id)
+                )
+                self._set_branch(conversation_id, parent, message_id)
+                parent = message_id
 
     def _migrate_legacy(self) -> None:
         tables = {
@@ -175,12 +205,113 @@ class ConversationStore:
         fields = ("id", "uuid", "card_id", "card_label", "deck_name", "title", "created_at", "updated_at", "message_count")
         return [dict(zip(fields, row)) for row in rows]
 
-    def messages(self, conversation_id: int) -> list[dict[str, str]]:
-        rows = self.connection.execute(
-            "SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY id",
-            (conversation_id,),
+    def _set_branch(self, conversation_id: int, parent_id: int, child_id: int) -> None:
+        self.connection.execute(
+            """INSERT INTO branch_selection(conversation_id, parent_id, child_id)
+               VALUES (?, ?, ?) ON CONFLICT(conversation_id, parent_id)
+               DO UPDATE SET child_id = excluded.child_id""",
+            (conversation_id, parent_id, child_id),
+        )
+
+    def message(self, conversation_id: int, message_id: int) -> dict:
+        row = self.connection.execute(
+            """SELECT id, parent_id, role, content, attachments_json
+               FROM chat_messages WHERE conversation_id = ? AND id = ?""",
+            (conversation_id, message_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Message not found in conversation")
+        return {"id": row[0], "parent_id": row[1], "role": row[2],
+                "content": row[3], "attachments": json.loads(row[4])}
+
+    def _display_message(self, conversation_id: int, message_id: int) -> dict:
+        message = self.message(conversation_id, message_id)
+        siblings = self.connection.execute(
+            "SELECT id FROM chat_messages WHERE conversation_id = ? AND parent_id = ? ORDER BY id",
+            (conversation_id, message["parent_id"]),
         ).fetchall()
-        return [{"role": role, "content": content} for role, content in rows]
+        options = [row[0] for row in siblings]
+        message["branch_index"] = options.index(message_id) + 1
+        message["branch_total"] = len(options)
+        return message
+
+    def messages(self, conversation_id: int) -> list[dict]:
+        thread = []
+        parent = 0
+        while True:
+            row = self.connection.execute(
+                "SELECT child_id FROM branch_selection WHERE conversation_id = ? AND parent_id = ?",
+                (conversation_id, parent),
+            ).fetchone()
+            if not row:
+                break
+            thread.append(self._display_message(conversation_id, row[0]))
+            parent = row[0]
+        return thread
+
+    def history_until(self, conversation_id: int, message_id: int) -> list[dict]:
+        nodes = []
+        seen = set()
+        while message_id:
+            if message_id in seen:
+                raise ValueError("Cyclic conversation")
+            seen.add(message_id)
+            message = self.message(conversation_id, message_id)
+            nodes.append(message)
+            message_id = message["parent_id"]
+        return list(reversed(nodes))
+
+    def select_branch(self, conversation_id: int, message_id: int) -> None:
+        message = self.message(conversation_id, message_id)
+        with self.connection:
+            self._set_branch(conversation_id, message["parent_id"], message_id)
+
+    def adjacent_branch(self, conversation_id: int, message_id: int, direction: int) -> int | None:
+        message = self.message(conversation_id, message_id)
+        siblings = [row[0] for row in self.connection.execute(
+            "SELECT id FROM chat_messages WHERE conversation_id = ? AND parent_id = ? ORDER BY id",
+            (conversation_id, message["parent_id"]),
+        )]
+        index = siblings.index(message_id) + direction
+        if 0 <= index < len(siblings):
+            self.select_branch(conversation_id, siblings[index])
+            return siblings[index]
+        return None
+
+    def append_branch(
+        self, conversation_id: int, parent_id: int, role: str, content: str,
+        attachments: list[dict] | None = None, select: bool = True,
+    ) -> int:
+        if role not in ("user", "assistant"):
+            raise ValueError("Unsupported message role")
+        if parent_id:
+            self.message(conversation_id, parent_id)
+        now = int(time.time())
+        with self.connection:
+            cursor = self.connection.execute(
+                """INSERT INTO chat_messages(conversation_id, parent_id, role, content, attachments_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (conversation_id, parent_id, role, content, json.dumps(attachments or []), now),
+            )
+            message_id = cursor.lastrowid
+            if select:
+                self._set_branch(conversation_id, parent_id, message_id)
+            if role == "user" and parent_id == 0:
+                self.connection.execute(
+                    "UPDATE conversations SET title = ? WHERE id = ?", (self._title(content), conversation_id)
+                )
+            self.connection.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
+            )
+        return message_id
+
+    def fork_user(self, conversation_id: int, message_id: int, content: str) -> int:
+        previous = self.message(conversation_id, message_id)
+        if previous["role"] != "user":
+            raise ValueError("Only user messages can be edited")
+        return self.append_branch(
+            conversation_id, previous["parent_id"], "user", content, previous["attachments"]
+        )
 
     def context(self, conversation_id: int) -> tuple[str, list[dict[str, str]]] | None:
         row = self.connection.execute(
@@ -190,35 +321,34 @@ class ConversationStore:
         return (row[0], json.loads(row[1])) if row else None
 
     def add_user_message(
-        self, conversation_id: int, content: str, system_prompt: str, images: list[dict[str, str]]
-    ) -> None:
-        now = int(time.time())
+        self, conversation_id: int, content: str, system_prompt: str,
+        images: list[dict[str, str]], attachments: list[dict] | None = None,
+    ) -> int:
         with self.connection:
-            first = not self.messages(conversation_id)
             self.connection.execute(
                 "INSERT OR IGNORE INTO chat_contexts VALUES (?, ?, ?)",
                 (conversation_id, system_prompt, json.dumps(images)),
             )
-            self.connection.execute(
-                "INSERT INTO chat_messages(conversation_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
-                (conversation_id, content, now),
-            )
-            self.connection.execute(
-                "UPDATE conversations SET title = CASE WHEN ? THEN ? ELSE title END, updated_at = ? WHERE id = ?",
-                (first, self._title(content), now, conversation_id),
+            parent = self.messages(conversation_id)
+            return self.append_branch(
+                conversation_id, parent[-1]["id"] if parent else 0,
+                "user", content, attachments,
             )
 
-    def append(self, conversation_id: int, role: str, content: str) -> None:
-        if role not in ("user", "assistant"):
-            raise ValueError("Unsupported message role")
+    def append(self, conversation_id: int, role: str, content: str) -> int:
+        thread = self.messages(conversation_id)
+        return self.append_branch(
+            conversation_id, thread[-1]["id"] if thread else 0, role, content
+        )
+
+    def append_status(self, conversation_id: int, message_id: int, status: str) -> None:
+        message = self.message(conversation_id, message_id)
+        if message["role"] != "assistant":
+            raise ValueError("Status belongs on an assistant message")
         with self.connection:
             self.connection.execute(
-                "INSERT INTO chat_messages(conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (conversation_id, role, content, int(time.time())),
-            )
-            self.connection.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (int(time.time()), conversation_id),
+                "UPDATE chat_messages SET content = ? WHERE id = ?",
+                (message["content"] + "\n\n" + status, message_id),
             )
 
     def delete(self, conversation_id: int) -> None:
@@ -238,17 +368,33 @@ class ConversationStore:
         conversations = []
         for entry in self.list_conversations():
             backup = {key: value for key, value in entry.items() if key not in ("id", "message_count")}
-            backup["messages"] = self.messages(entry["id"])
+            rows = self.connection.execute(
+                """SELECT id, parent_id, role, content, attachments_json, created_at
+                   FROM chat_messages WHERE conversation_id = ? ORDER BY id""",
+                (entry["id"],),
+            ).fetchall()
+            backup["messages"] = [
+                {"id": message_id, "parent_id": parent_id, "role": role,
+                 "content": content, "attachments": json.loads(attachments), "created_at": created_at}
+                for message_id, parent_id, role, content, attachments, created_at in rows
+            ]
+            backup["branches"] = {
+                str(parent): child for parent, child in self.connection.execute(
+                    "SELECT parent_id, child_id FROM branch_selection WHERE conversation_id = ?",
+                    (entry["id"],),
+                )
+            }
             context = self.context(entry["id"])
             backup["context"] = {
                 "system_prompt": context[0], "images": context[1]
             } if context else None
             conversations.append(backup)
-        return {"format": "anki-tutor-history", "version": 1, "conversations": conversations}
+        return {"format": "anki-tutor-history", "version": 2, "conversations": conversations}
 
     def import_data(self, backup: dict) -> tuple[int, int]:
-        if not isinstance(backup, dict) or backup.get("format") != "anki-tutor-history" or backup.get("version") != 1:
+        if not isinstance(backup, dict) or backup.get("format") != "anki-tutor-history" or backup.get("version") not in (1, 2):
             raise ValueError("Unsupported history file")
+        version = backup["version"]
         conversations = backup.get("conversations")
         if not isinstance(conversations, list):
             raise ValueError("Invalid conversations")
@@ -269,6 +415,21 @@ class ConversationStore:
                 or not isinstance(message.get("content"), str) for message in messages
             ):
                 raise ValueError("Invalid messages")
+            if version == 2:
+                ids = [message.get("id") for message in messages]
+                if any(not isinstance(message_id, int) or message_id <= 0 for message_id in ids) or len(ids) != len(set(ids)):
+                    raise ValueError("Invalid message identifiers")
+                parents = {message.get("parent_id") for message in messages}
+                if any(not isinstance(parent, int) or parent < 0 or (parent and parent not in ids) for parent in parents):
+                    raise ValueError("Invalid message parents")
+                if any(not isinstance(message.get("attachments"), list) or not isinstance(message.get("created_at"), int)
+                       for message in messages):
+                    raise ValueError("Invalid message metadata")
+                branches = entry.get("branches")
+                if not isinstance(branches, dict) or any(
+                    not str(parent).isdigit() or child not in ids for parent, child in branches.items()
+                ):
+                    raise ValueError("Invalid branch selections")
             context = entry.get("context")
             if context is not None and (
                 not isinstance(context, dict) or not isinstance(context.get("system_prompt"), str)
@@ -286,11 +447,42 @@ class ConversationStore:
                     entry["card_id"], entry["card_label"], entry["deck_name"],
                     entry["title"], entry["created_at"], entry["updated_at"], entry["uuid"],
                 )
-                self.connection.executemany(
-                    "INSERT INTO chat_messages(conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                    ((conversation_id, message["role"], message["content"], entry["created_at"])
-                     for message in entry["messages"]),
-                )
+                if version == 1:
+                    parent = 0
+                    for message in entry["messages"]:
+                        cursor = self.connection.execute(
+                            """INSERT INTO chat_messages(conversation_id, parent_id, role, content, created_at)
+                               VALUES (?, ?, ?, ?, ?)""",
+                            (conversation_id, parent, message["role"], message["content"], entry["created_at"]),
+                        )
+                        self._set_branch(conversation_id, parent, cursor.lastrowid)
+                        parent = cursor.lastrowid
+                else:
+                    remapped = {0: 0}
+                    remaining = list(entry["messages"])
+                    while remaining:
+                        progress = False
+                        for message in remaining[:]:
+                            parent = message["parent_id"]
+                            if parent not in remapped:
+                                continue
+                            cursor = self.connection.execute(
+                                """INSERT INTO chat_messages(conversation_id, parent_id, role, content, attachments_json, created_at)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (conversation_id, remapped[parent], message["role"], message["content"],
+                                 json.dumps(message["attachments"]), message["created_at"]),
+                            )
+                            remapped[message["id"]] = cursor.lastrowid
+                            remaining.remove(message)
+                            progress = True
+                        if not progress:
+                            raise ValueError("Invalid message tree")
+                    for parent, child in entry["branches"].items():
+                        if int(parent) not in remapped:
+                            raise ValueError("Invalid branch parent")
+                        if remapped[int(parent)] != self.message(conversation_id, remapped[child])["parent_id"]:
+                            raise ValueError("Invalid branch parent")
+                        self._set_branch(conversation_id, remapped[int(parent)], remapped[child])
                 if entry["context"] is not None:
                     self.connection.execute(
                         "INSERT INTO chat_contexts VALUES (?, ?, ?)",

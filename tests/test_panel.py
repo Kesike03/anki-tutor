@@ -50,6 +50,9 @@ def load_panel():
         def eval(self, code):
             self.last_js = code
 
+        def set_bridge_command(self, handler, context):
+            self.bridge = handler
+
     aqt.webview.AnkiWebView = FakeWeb
     aqt.theme.theme_manager = SimpleNamespace(night_mode=False)
     aqt.gui_hooks = SimpleNamespace(theme_did_change=[])
@@ -59,7 +62,7 @@ def load_panel():
         "QScrollArea", "QSizePolicy", "QStackedWidget", "QStyle", "QTextEdit",
         "QTimer", "QToolButton", "QUrl", "QVBoxLayout", "QWidget", "Qt",
         "QColor", "QPalette", "QTreeWidget", "QTreeWidgetItem", "QDialog",
-        "QFileDialog",
+        "QFileDialog", "QInputDialog", "QListWidget", "QApplication",
     ):
         for source in (QtWidgets, QtCore, QtGui):
             if hasattr(source, name):

@@ -13,6 +13,8 @@ SOURCES = (
     "__init__.py",
     "panel.py",
     "history.py",
+    "attachments.py",
+    "harness.py",
     "protocols.py",
     "context.py",
     "i18n.py",

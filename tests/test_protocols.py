@@ -76,6 +76,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(gemini[0]["parts"][1]["inlineData"]["mimeType"], "image/png")
         self.assertEqual(gemini[1]["parts"][0]["text"], turns[0]["content"])
 
+    def test_user_attachments_follow_the_message_across_providers(self):
+        attachments = [
+            {"name": "diagram.png", "kind": "image", "mime": "image/png", "data": "cGljdHVyZQ=="},
+            {"name": "notes.txt", "kind": "text", "mime": "text/plain", "data": "aGVsbG8="},
+        ]
+        turns = [{"role": "user", "content": "Explain", "attachments": attachments}]
+        for mode in DEFAULTS:
+            spec = build_request(self.config(mode), "prompt", turns)
+            body = spec.body["contents"] if mode == "gemini" else spec.body["input"] if mode == "responses" else spec.body["messages"]
+            self.assertIn("hello", str(body))
+            self.assertIn("cGljdHVyZQ==", str(body))
+        pdf_turn = [{"role": "user", "content": "Read", "attachments": [
+            {"name": "doc.pdf", "kind": "pdf", "mime": "application/pdf", "data": "cGRm"}
+        ]}]
+        with self.assertRaisesRegex(ProtocolError, "pdf_not_supported"):
+            build_request(self.config("chat"), "prompt", pdf_turn)
+        for mode in ("responses", "claude", "gemini"):
+            self.assertIn("cGRm", str(build_request(self.config(mode), "prompt", pdf_turn).body))
+
     def test_invalid_settings_and_responses(self):
         config = self.config("chat")
         config["api_key"] = ""

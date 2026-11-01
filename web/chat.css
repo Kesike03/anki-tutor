@@ -28,3 +28,11 @@ body { font: 13px/1.55 system-ui, sans-serif; overflow-wrap: anywhere; }
 .body th, .body td { border: 1px solid var(--border); padding: 4px 7px; }
 .body img { max-width: 100%; }
 .MathJax { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+.files { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; margin-top: 6px; }
+.controls { display: flex; gap: 2px; align-items: center; margin: 6px -4px -5px;
+    min-height: 27px; }
+.controls button { border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    font-size: 17px; min-width: 28px; height: 26px; border-radius: 4px; padding: 0 4px; }
+.controls button:hover:enabled { background: var(--bg); color: var(--text); }
+.controls button:disabled { opacity: .35; cursor: default; }
+.branch-count { color: var(--muted); font-size: 11px; min-width: 28px; text-align: center; }

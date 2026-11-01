@@ -1,5 +1,6 @@
 """Payload and response adapters for four AI API families."""
 
+import base64
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
@@ -25,6 +26,45 @@ class RequestSpec:
 
 class ProtocolError(Exception):
     pass
+
+
+def _message_for_provider(message: dict, mode: str) -> dict:
+    role = message["role"]
+    attachments = message.get("attachments") or []
+    if not attachments or role != "user":
+        return {"role": role, "content": message["content"]}
+    text = message["content"]
+    for item in attachments:
+        if item["kind"] == "text":
+            content = base64.b64decode(item["data"]).decode("utf-8-sig")
+            text += f"\n\nAttached file ({item['name']}):\n{content}"
+    media = [item for item in attachments if item["kind"] != "text"]
+    if mode == "chat" and any(item["kind"] == "pdf" for item in media):
+        raise ProtocolError("pdf_not_supported")
+    if not media:
+        return {"role": "user", "content": text}
+    if mode == "chat":
+        parts = [{"type": "text", "text": text}]
+        parts.extend({"type": "image_url", "image_url": {"url": f"data:{item['mime']};base64,{item['data']}"}} for item in media)
+    elif mode == "responses":
+        parts = [{"type": "input_text", "text": text}]
+        for item in media:
+            if item["kind"] == "image":
+                parts.append({"type": "input_image", "image_url": f"data:{item['mime']};base64,{item['data']}"})
+            else:
+                parts.append({"type": "input_file", "filename": item["name"], "file_data": f"data:application/pdf;base64,{item['data']}"})
+    elif mode == "claude":
+        parts = [{"type": "text", "text": text}]
+        for item in media:
+            parts.append({
+                "type": "image" if item["kind"] == "image" else "document",
+                "source": {"type": "base64", "media_type": item["mime"], "data": item["data"]},
+            })
+    else:
+        parts = [{"text": text}]
+        parts.extend({"inlineData": {"mimeType": item["mime"], "data": item["data"]}} for item in media)
+        return {"role": "user", "parts": parts}
+    return {"role": "user", "content": parts}
 
 
 def build_request(
@@ -60,6 +100,7 @@ def build_request(
     image_caption = "Reference images from the current Anki card: " + ", ".join(
         image["name"] for image in images
     )
+    turns = [_message_for_provider(message, mode) for message in messages]
 
     if mode == "chat":
         headers["Authorization"] = f"Bearer {key}"
@@ -80,7 +121,7 @@ def build_request(
         ] if images else []
         body = {
             "model": model,
-            "messages": [{"role": "system", "content": system_prompt}, *image_messages, *messages],
+            "messages": [{"role": "system", "content": system_prompt}, *image_messages, *turns],
         }
     elif mode == "responses":
         headers["Authorization"] = f"Bearer {key}"
@@ -96,7 +137,7 @@ def build_request(
                 ],
             }
         ] if images else []
-        body = {"model": model, "instructions": system_prompt, "input": image_messages + messages}
+        body = {"model": model, "instructions": system_prompt, "input": image_messages + turns}
     elif mode == "claude":
         headers["x-api-key"] = key
         headers["anthropic-version"] = "2023-06-01"
@@ -121,7 +162,7 @@ def build_request(
             "model": model,
             "max_tokens": 2048,
             "system": system_prompt,
-            "messages": image_messages + messages,
+            "messages": image_messages + turns,
         }
     else:
         headers["x-goog-api-key"] = key
@@ -140,11 +181,9 @@ def build_request(
         body = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "contents": image_contents + [
-                {
-                    "role": "model" if message["role"] == "assistant" else "user",
-                    "parts": [{"text": message["content"]}],
-                }
-                for message in messages
+                {"role": "model" if message["role"] == "assistant" else "user",
+                 "parts": turn["parts"] if "parts" in turn else [{"text": turn["content"]}]}
+                for message, turn in zip(messages, turns)
             ],
         }
     return RequestSpec(url, headers, body)

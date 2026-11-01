@@ -6,7 +6,13 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
-const context = vm.createContext({ window: {}, console });
+const context = vm.createContext({
+    window: {}, console,
+    document: {
+        addEventListener: () => {},
+        getElementById: () => ({ addEventListener: () => {} }),
+    },
+});
 vm.runInContext(fs.readFileSync(path.join(root, "web/vendor/markdown-it.min.js"), "utf8"), context);
 context.window.markdownit = context.markdownit;
 vm.runInContext(fs.readFileSync(path.join(root, "web/chat.js"), "utf8"), context);
