@@ -2,8 +2,8 @@
 
 from aqt import gui_hooks, mw
 
+from .browser_tools import register as register_browser_tools
 from .panel import TutorPanel
-
 
 _panel = None
 
@@ -52,5 +52,6 @@ gui_hooks.reviewer_did_show_question.append(_on_question)
 gui_hooks.reviewer_did_show_answer.append(_on_answer)
 gui_hooks.state_did_change.append(_on_state_change)
 mw.addonManager.setWebExports(__name__, r"web/.*")
+register_browser_tools()
 if hook := getattr(gui_hooks, "addon_manager_will_install_addon", None):
     hook.append(_on_addon_install)

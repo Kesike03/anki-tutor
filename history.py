@@ -1,40 +1,70 @@
-"""Conversation browser with profile-local backup and cleanup actions."""
+"""Conversation browser with search, readable grouping, and profile backups."""
+
+from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from aqt.qt import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
+    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     Qt,
 )
 
+try:
+    from .authoring_style import apply_dialog_style
+except ImportError:
+    from authoring_style import apply_dialog_style
+
+
+def _when(timestamp: int) -> str:
+    try:
+        return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
 
 class HistoryDialog(QDialog):
     def __init__(self, panel) -> None:
         super().__init__(panel.mw)
         self.panel = panel
+        self.entries: dict[int, dict] = {}
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.resize(640, 460)
+        self.resize(820, 620)
         layout = QVBoxLayout(self)
+        self.search = QLineEdit()
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.refresh)
+        layout.addWidget(self.search)
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Card / conversation", "Messages"])
+        self.tree.setColumnCount(3)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.itemDoubleClicked.connect(self._open)
-        layout.addWidget(self.tree)
+        layout.addWidget(self.tree, 3)
+        self.meta = QLabel()
+        self.meta.setWordWrap(True)
+        self.meta.setObjectName("authoringHint")
+        layout.addWidget(self.meta)
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
-        self.preview.setMinimumHeight(85)
-        layout.addWidget(self.preview)
+        self.preview.setMinimumHeight(130)
+        layout.addWidget(self.preview, 2)
         self.empty = QLabel()
         layout.addWidget(self.empty)
         row = QHBoxLayout()
@@ -61,36 +91,64 @@ class HistoryDialog(QDialog):
         row.addWidget(self.delete_all_button)
         layout.addLayout(row)
         self.tree.currentItemChanged.connect(self._update_actions)
+        apply_dialog_style(self, panel.mw, panel.config)
+        self._translate()
         self.refresh()
 
-    def refresh(self) -> None:
+    def _translate(self) -> None:
         text = self.panel.text
         self.setWindowTitle(text("history_manager"))
-        self.tree.setHeaderLabels([text("conversation"), text("message_count")])
-        self.open_button.setText(text("reveal"))
+        self.search.setPlaceholderText(text("history_search"))
+        self.tree.setHeaderLabels([
+            text("conversation"), text("message_count"), text("history_updated"),
+        ])
+        self.open_button.setText(text("history_open"))
         self.delete_button.setText(text("delete_conversation"))
         self.delete_card_button.setText(text("delete_card"))
         self.delete_all_button.setText(text("delete_all"))
         self.import_button.setText(text("import_history"))
         self.export_button.setText(text("export_history"))
         self.empty.setText(text("history_empty"))
+
+    def refresh(self) -> None:
+        text = self.panel.text
         self.tree.clear()
         self.preview.clear()
+        self.meta.clear()
+        self.entries.clear()
         entries = self.panel.store.list_conversations() if self.panel.store else []
-        cards = {}
+        needle = self.search.text().strip().casefold()
+        if needle:
+            entries = [
+                entry for entry in entries
+                if needle in " ".join((
+                    entry.get("title", ""),
+                    entry.get("card_label", ""),
+                    entry.get("deck_name", ""),
+                )).casefold()
+            ]
+        entries.sort(key=lambda entry: (entry["updated_at"], entry["id"]), reverse=True)
+        groups = {}
         for entry in entries:
             card_id = entry["card_id"]
-            if card_id not in cards:
-                card = QTreeWidgetItem(self.tree)
-                card.setText(0, " | ".join(filter(None, (entry["deck_name"], entry["card_label"]))))
-                card.setToolTip(0, text("card", id=card_id))
-                card.setData(0, Qt.ItemDataRole.UserRole, (card_id, None))
-                card.setExpanded(True)
-                cards[card_id] = card
-            item = QTreeWidgetItem(cards[card_id])
+            if card_id not in groups:
+                group = QTreeWidgetItem(self.tree)
+                label = (
+                    text("home_collection_chat") if card_id == 0
+                    else " · ".join(filter(None, (entry["deck_name"], entry["card_label"])))
+                )
+                group.setText(0, label)
+                group.setToolTip(0, text("home_collection_chat") if card_id == 0 else text("card", id=card_id))
+                group.setData(0, Qt.ItemDataRole.UserRole, (card_id, None))
+                group.setExpanded(True)
+                groups[card_id] = group
+            item = QTreeWidgetItem(groups[card_id])
             item.setText(0, entry["title"])
             item.setText(1, str(entry["message_count"]))
+            item.setText(2, _when(entry["updated_at"]))
+            item.setToolTip(0, entry["title"])
             item.setData(0, Qt.ItemDataRole.UserRole, (card_id, entry["id"]))
+            self.entries[entry["id"]] = entry
         self.empty.setVisible(not entries)
         self.export_button.setEnabled(bool(entries))
         self.delete_all_button.setEnabled(bool(entries))
@@ -102,24 +160,37 @@ class HistoryDialog(QDialog):
 
     def _update_actions(self, *_args) -> None:
         card_id, conversation_id = self._selection()
-        self.preview.setPlainText(
-            "\n\n".join(
-                f"{self.panel.text('you' if message['role'] == 'user' else 'tutor')}: {message['content']}"
-                for message in self.panel.store.messages(conversation_id)
-            ) if conversation_id is not None and self.panel.store is not None else ""
-        )
-        self.open_button.setEnabled(
-            conversation_id is not None and self.panel.card is not None
-            and self.panel.card.id == card_id
-        )
+        entry = self.entries.get(conversation_id) if conversation_id else None
+        if entry:
+            meta = " · ".join(filter(None, (
+                entry.get("deck_name"), entry.get("card_label"),
+                _when(entry.get("updated_at")),
+                self.panel.text("messages", count=entry.get("message_count", 0)),
+            )))
+            self.meta.setText(meta)
+            self.preview.setPlainText(
+                "\n\n".join(
+                    f"{self.panel.text('you' if message['role'] == 'user' else 'tutor')}: "
+                    f"{message['content']}"
+                    for message in self.panel.store.messages(conversation_id)
+                )
+            )
+        else:
+            self.meta.clear()
+            self.preview.clear()
+        self.open_button.setEnabled(conversation_id is not None and card_id is not None)
         self.delete_button.setEnabled(conversation_id is not None)
         self.delete_card_button.setEnabled(card_id is not None)
 
     def _open(self, item, _column) -> None:
         card_id, conversation_id = item.data(0, Qt.ItemDataRole.UserRole)
-        if conversation_id is not None and self.panel.card is not None and self.panel.card.id == card_id:
-            self.panel.open_conversation(card_id, conversation_id)
-            self.hide()
+        if conversation_id is None:
+            return
+        if card_id == 0:
+            self.panel.open_collection_conversation(conversation_id)
+        else:
+            self.panel.open_card_conversation(card_id, conversation_id)
+        self.hide()
 
     def _open_selected(self) -> None:
         item = self.tree.currentItem()

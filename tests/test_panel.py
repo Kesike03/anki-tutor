@@ -63,12 +63,22 @@ def load_panel():
         "QTimer", "QToolButton", "QUrl", "QVBoxLayout", "QWidget", "Qt",
         "QColor", "QPalette", "QTreeWidget", "QTreeWidgetItem", "QDialog",
         "QFileDialog", "QInputDialog", "QListWidget", "QListWidgetItem", "QApplication",
-        "QBuffer", "QIODevice", "QImage", "QSpinBox",
+        "QBuffer", "QIODevice", "QImage", "QSpinBox", "QAbstractItemView",
+        "QHeaderView", "QProgressBar", "QTableWidget", "QTableWidgetItem",
+        "QObject", "QDialogButtonBox", "QGroupBox", "QFormLayout", "QGridLayout",
+        "QDoubleSpinBox", "QTabWidget",
     ):
         for source in (QtWidgets, QtCore, QtGui):
             if hasattr(source, name):
                 setattr(aqt.qt, name, getattr(source, name))
                 break
+    from PyQt6.QtCore import QObject, pyqtSignal
+    from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+    aqt.qt.QObject = QObject
+    aqt.qt.pyqtSignal = pyqtSignal
+    aqt.qt.QNetworkAccessManager = QNetworkAccessManager
+    aqt.qt.QNetworkReply = QNetworkReply
+    aqt.qt.QNetworkRequest = QNetworkRequest
     sys.modules.update({"aqt": aqt, "aqt.qt": aqt.qt, "aqt.theme": aqt.theme,
                         "aqt.webview": aqt.webview})
     root = Path(__file__).resolve().parents[1]
@@ -281,12 +291,18 @@ class PanelTests(unittest.TestCase):
     def test_settings_open_as_dialog_and_font_size_applies(self):
         self.panel._open_settings()
         self.assertIsNotNone(self.panel.settings_dialog)
-        self.assertIs(self.panel.settings_scroll.parent(), self.panel.settings_dialog)
+        self.assertIs(self.panel.settings_tabs.parent(), self.panel.settings_dialog)
         self.assertTrue(self.panel.settings_dialog.isVisible())
+        self.assertEqual(self.panel.settings_tabs.count(), 4)
+        self.assertIs(self.panel.settings_tabs.widget(3), self.panel.usage_page)
         self.panel.font_size_spin.setValue(20)
         self.assertEqual(self.panel.config["font_size"], 20)
         self.assertEqual(self.panel._applied_font_size, 20)
         self.assertIn("font-size: 20px", self.panel.styleSheet())
+        self.panel.tts_rate_spin.setValue(0.2)
+        self.assertAlmostEqual(self.panel.config["tts_rate"], 0.2)
+        self.panel.tts_skip_code_check.setChecked(False)
+        self.assertFalse(self.panel.config["tts_skip_code"])
         self.panel.settings_dialog.close()
 
     def test_settings_dialog_survives_profile_reopen(self):
@@ -295,8 +311,363 @@ class PanelTests(unittest.TestCase):
         self.panel.open_profile()
         self.panel._open_settings()
         self.assertIsNotNone(self.panel.settings_dialog)
-        self.assertIs(self.panel.settings_scroll.parent(), self.panel.settings_dialog)
+        self.assertIs(self.panel.settings_tabs.parent(), self.panel.settings_dialog)
         self.panel.settings_dialog.close()
+
+
+    def test_authoring_dialogs_open_and_write_with_undo(self):
+        from authoring_dialog import SaveReplyDialog
+        from bulk_fill import BulkFillDialog
+
+        model = {
+            "name": "Vocabulary",
+            "type": 0,
+            "flds": [{"name": "Front"}, {"name": "Back"}, {"name": "Extra"}],
+            "tmpls": [{"qfmt": "{{Front}}", "afmt": "{{Back}}"}],
+        }
+
+        class Note:
+            def __init__(self):
+                self.id = 55
+                self._values = {"Front": "hola", "Back": "hello", "Extra": ""}
+                self.tags = []
+
+            def keys(self):
+                return list(self._values)
+
+            def note_type(self):
+                return model
+
+            def __getitem__(self, name):
+                return self._values[name]
+
+            def __setitem__(self, name, value):
+                self._values[name] = value
+
+            def __contains__(self, name):
+                return name in self._values
+
+        note = Note()
+        card = SimpleNamespace(
+            id=1, did=1, note=lambda: note, note_type=lambda: model,
+            current_deck_id=lambda: 1,
+        )
+        self.mw.col.get_note = lambda _note_id: note
+        self.mw.col.update_note = lambda _note: None
+        dialog = SaveReplyDialog(self.mw, card, self.panel.config, "Study note", parent=self.mw)
+        dialog.field_combo.setCurrentText("Extra")
+        dialog._save()
+        self.assertIn("Study note", note["Extra"])
+        self.assertTrue(dialog.undo_button.isEnabled())
+        dialog._undo()
+        self.assertEqual(note["Extra"], "")
+        dialog.close()
+
+        bulk = BulkFillDialog(self.mw, [55], self.panel.config, parent=self.mw)
+        self.assertEqual(bulk.model_combo.currentText(), "Vocabulary")
+        self.assertEqual(bulk.fields, ["Front", "Back", "Extra"])
+        bulk.close()
+
+
+    def test_bulk_fill_generates_previews_and_applies_undo(self):
+        from bulk_fill import BulkFillDialog
+
+        model = {
+            "name": "Vocabulary",
+            "type": 0,
+            "flds": [{"name": "Front"}, {"name": "Back"}, {"name": "Extra"}],
+            "tmpls": [{"qfmt": "{{Front}}", "afmt": "{{Back}}"}],
+        }
+
+        class Note:
+            def __init__(self):
+                self.id = 77
+                self._values = {"Front": "hola", "Back": "hello", "Extra": ""}
+                self.tags = []
+
+            def keys(self):
+                return list(self._values)
+
+            def note_type(self):
+                return model
+
+            def __getitem__(self, name):
+                return self._values[name]
+
+            def __setitem__(self, name, value):
+                self._values[name] = value
+
+            def __contains__(self, name):
+                return name in self._values
+
+        note = Note()
+        self.mw.col.get_note = lambda _note_id: note
+        self.mw.col.update_note = lambda _note: None
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.dumps({"choices": [{"message": {
+                    "content": '{"definition":"a greeting","warnings":[]}'
+                }}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
+            self.panel.key_input.setText("test-key")
+            self.panel._save_settings()
+            dialog = BulkFillDialog(self.mw, [77], self.panel.config, parent=self.mw)
+            dialog.mapping_rows[0][1].setText("definition")
+            dialog.mapping_rows[0][2].setCurrentText("Extra")
+            dialog.user_edit.setPlainText("Define {Front}")
+            dialog._generate()
+            deadline = time.monotonic() + 5
+            while dialog.pages.currentIndex() == 0 and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(dialog.pages.currentIndex(), 1)
+            self.assertEqual(len(dialog.changes), 1)
+            dialog._apply()
+            self.assertEqual(note["Extra"], "a greeting")
+            dialog._undo()
+            self.assertEqual(note["Extra"], "")
+            dialog.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
+    def test_conversation_cards_dialog_generates_and_adds(self):
+        from authoring_dialog import ConversationCardsDialog
+
+        model = {
+            "name": "Vocabulary", "type": 0,
+            "flds": [{"name": "Front"}, {"name": "Back"}, {"name": "Extra"}],
+            "tmpls": [{"qfmt": "{{Front}}", "afmt": "{{Back}}"}],
+        }
+
+        class Note:
+            def __init__(self, note_id=0):
+                self.id = note_id
+                self._values = {"Front": "hola", "Back": "hello", "Extra": ""}
+                self.tags = []
+
+            def keys(self):
+                return list(self._values)
+
+            def __getitem__(self, name):
+                return self._values[name]
+
+            def __setitem__(self, name, value):
+                self._values[name] = value
+
+            def __contains__(self, name):
+                return name in self._values
+
+        note = Note(88)
+        card = SimpleNamespace(
+            id=1, did=1, note=lambda: note, note_type=lambda: model,
+            current_deck_id=lambda: 1,
+        )
+        added = []
+        self.mw.col.models = SimpleNamespace(all=lambda: [model], get=lambda _mid: model, by_name=lambda _name: model)
+        self.mw.col.decks = SimpleNamespace(
+            name=lambda _did: "Vocabulary",
+            all_names_and_ids=lambda: [SimpleNamespace(name="Vocabulary")],
+            id_for_name=lambda _name: 1,
+        )
+        self.mw.col.new_note = lambda _model: Note()
+        self.mw.col.add_note = lambda current, deck_id: (setattr(current, "id", 90 + len(added)), added.append(deck_id), current.id)[2]
+        self.mw.col.remove_notes = lambda ids: [added.clear() for _ in ids]
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                content = json.dumps({
+                    "cards": [{"fields": {
+                        "Front": "gato", "Back": "cat", "Extra": "animal",
+                    }, "source_quote": "gato means cat"}],
+                    "warnings": [],
+                })
+                body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
+            self.panel.key_input.setText("test-key")
+            self.panel._save_settings()
+            dialog = ConversationCardsDialog(
+                self.mw, card, self.panel.config,
+                [{"role": "user", "content": "Make a card"}], parent=self.mw,
+            )
+            deadline = time.monotonic() + 5
+            while not getattr(dialog, "_cards", None) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(len(dialog._cards), 1)
+            dialog._add()
+            self.assertEqual(added, [1])
+            dialog._undo()
+            self.assertEqual(added, [])
+            dialog.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
+    def test_collection_home_and_collection_chat(self):
+        self.panel._refresh_home(force=True)
+        self.assertEqual(self.panel.pages.currentWidget(), self.panel.home_view)
+        self.assertIn("0", self.panel.home_view.summary.text())
+        self.panel._start_collection_chat("What is due today?")
+        self.assertTrue(self.panel.collection_chat_open)
+        self.assertIsNone(self.panel.card)
+        self.assertEqual(self.panel.conversation_id, self.panel.store.active(0))
+        self.assertEqual(self.panel.composer.toPlainText(), "What is due today?")
+        prompt = self.panel._collection_prompt()
+        self.assertIn("Anki collection snapshot", prompt)
+        self.panel._show_home()
+        self.assertFalse(self.panel.collection_chat_open)
+        self.assertEqual(self.panel.pages.currentWidget(), self.panel.home_view)
+        self.assertIsNone(self.panel.conversation_id)
+
+
+    def test_collection_chat_sends_collection_context(self):
+        captured = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                captured.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                body = json.dumps({"choices": [{"message": {"content": "Three decks."}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
+            self.panel.key_input.setText("test-key")
+            self.panel._save_settings()
+            self.panel._start_collection_chat("What is due?")
+            self.panel._send()
+            deadline = time.monotonic() + 5
+            while self.panel.pending and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertFalse(self.panel.pending)
+            instructions = captured[0]["messages"][0]["content"]
+            self.assertIn("COLLECTION MODE", instructions)
+            self.assertIn("Anki collection snapshot", instructions)
+            self.assertIn("Three decks.", self.panel.store.messages(self.panel.store.active(0))[-1]["content"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
+    def test_weak_areas_dialog_opens(self):
+        from insights_dialog import WeakAreasDialog
+
+        dialog = WeakAreasDialog(self.panel)
+        self.assertIsNotNone(dialog.table)
+        self.assertEqual(dialog.table.columnCount(), 6)
+        dialog.close()
+
+
+    def test_open_card_conversation_loads_card_and_navigates(self):
+        card = self.card(101)
+        self.mw.col.get_card = lambda _card_id: card
+        conversation = self.panel.store.create(101, "Hello", "Vocabulary")
+        self.panel.store.add_user_message(conversation, "Question", "Prompt", [])
+        self.panel.store.append(conversation, "assistant", "Answer")
+        opened = []
+        self.panel._open_card_in_browser = lambda current: opened.append(current.id)
+        self.panel.open_card_conversation(101, conversation)
+        self.assertEqual(self.panel.card.id, 101)
+        self.assertEqual(self.panel.conversation_id, conversation)
+        self.assertEqual(opened, [101])
+        self.assertEqual(self.panel.store.messages(conversation)[-1]["content"], "Answer")
+
+
+    def test_return_to_review_card_after_collection_chat(self):
+        self.panel.show_card(self.card(101))
+        collection = self.panel.store.create_collection()
+        self.panel.store.add_user_message(collection, "Deck question", "Prompt", [])
+        self.panel.open_collection_conversation(collection)
+        self.assertIsNone(self.panel.card)
+        self.assertEqual(self.panel.review_card.id, 101)
+        self.panel._return_to_review_card()
+        self.assertEqual(self.panel.card.id, 101)
+        self.assertFalse(self.panel.collection_chat_open)
+
+
+    def test_chat_records_token_usage_on_assistant_message(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.dumps({
+                    "choices": [{"message": {"content": "Hello there."}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.panel.host_input.setText(f"http://127.0.0.1:{server.server_port}")
+            self.panel.key_input.setText("test-key")
+            self.panel.show_card(self.card(101))
+            self.panel.composer.setPlainText("Hello")
+            self.panel._send()
+            deadline = time.monotonic() + 5
+            while self.panel.pending and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            message = self.panel.store.messages(self.panel.store.active(101))[-1]
+            usage = self.panel.usage.message_usage(message["id"])
+            self.assertEqual(usage["total"], 12)
+            self.assertIn("usage", self.panel.chat_web.last_js)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_two_conversations_and_anki_language(self):
         import anki.lang
@@ -314,9 +685,14 @@ class PanelTests(unittest.TestCase):
         self.panel.conversation_combo.setCurrentIndex(self.panel.conversation_combo.findData(first))
         self.assertEqual(self.panel.conversation_id, first)
         self.panel._show_history()
-        self.assertEqual(self.panel.history_dialog.tree.topLevelItemCount(), 1)
-        self.assertEqual(self.panel.history_dialog.tree.topLevelItem(0).childCount(), 2)
-        self.panel.history_dialog.hide()
+        history = self.panel.history_dialog
+        self.assertEqual(history.tree.topLevelItemCount(), 1)
+        self.assertEqual(history.tree.topLevelItem(0).childCount(), 2)
+        history.search.setText("First")
+        self.assertEqual(history.tree.topLevelItem(0).childCount(), 1)
+        history.search.clear()
+        self.assertEqual(history.tree.topLevelItem(0).childCount(), 2)
+        history.hide()
         anki.lang.current_lang = "en_US"
 
 

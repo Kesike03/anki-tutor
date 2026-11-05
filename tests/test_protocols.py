@@ -1,6 +1,9 @@
 import unittest
 
-from protocols import DEFAULTS, ProtocolError, build_request, parse_response, provider_error
+from protocols import (
+    DEFAULTS, ProtocolError, build_request, parse_response, parse_usage,
+    provider_error,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -51,6 +54,20 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(spec.body["contents"][1]["role"], "model")
         self.assertEqual(parse_response("gemini", {"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}), "Hello")
 
+
+    def test_structured_output_schema(self):
+        schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+        chat = build_request(self.config("chat"), "prompt", [], schema=schema).body
+        self.assertEqual(chat["response_format"]["json_schema"]["schema"], schema)
+        responses = build_request(self.config("responses"), "prompt", [], schema=schema).body
+        self.assertEqual(responses["text"]["format"]["schema"], schema)
+        claude = build_request(self.config("claude"), "prompt", [], schema=schema).body
+        self.assertEqual(claude["tools"][0]["input_schema"], schema)
+        tool_reply = {"content": [{"type": "tool_use", "input": {"answer": "yes"}}]}
+        self.assertEqual(parse_response("claude", tool_reply), '{"answer": "yes"}')
+        gemini = build_request(self.config("gemini"), "prompt", [], schema=schema).body
+        self.assertEqual(gemini["generationConfig"]["responseSchema"], schema)
+
     def test_full_endpoint_is_not_appended_twice(self):
         config = self.config("chat")
         config["api_host"] += "/chat/completions"
@@ -94,6 +111,22 @@ class ProtocolTests(unittest.TestCase):
             build_request(self.config("chat"), "prompt", pdf_turn)
         for mode in ("responses", "claude", "gemini"):
             self.assertIn("cGRm", str(build_request(self.config(mode), "prompt", pdf_turn).body))
+
+
+    def test_usage_normalization(self):
+        chat = {"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                          "prompt_tokens_details": {"cached_tokens": 30}}}
+        self.assertEqual(parse_usage("chat", chat), {
+            "input": 100, "output": 20, "total": 120, "cached": 30,
+        })
+        responses = {"usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}}
+        self.assertEqual(parse_usage("responses", responses)["total"], 100)
+        claude = {"usage": {"input_tokens": 50, "output_tokens": 5, "cache_read_input_tokens": 10}}
+        self.assertEqual(parse_usage("claude", claude)["cached"], 10)
+        gemini = {"usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 8,
+                                    "totalTokenCount": 48}}
+        self.assertEqual(parse_usage("gemini", gemini)["total"], 48)
+        self.assertIsNone(parse_usage("chat", {}))
 
     def test_invalid_settings_and_responses(self):
         config = self.config("chat")

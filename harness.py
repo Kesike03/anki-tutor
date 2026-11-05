@@ -28,6 +28,7 @@ If no tools are needed, answer normally without any tool block.
 
 Supported queries:
 - {"tool":"search_cards","query":"deck:Spanish is:due","limit":10}
+  limit is optional and is clamped to 1-20 by the client.
   Returns matching cards with IDs, decks, note types, and short front/back text.
 - {"tool":"get_card","card_id":123}
   Returns the details of one card.
@@ -56,6 +57,54 @@ Permission for Anki writes: __PERMISSION__.
 BLOCK = re.compile(r"(?m)^```anki-actions[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
 QUERY_BLOCK = re.compile(r"(?m)^```anki-query[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
 GENERIC_BLOCK = re.compile(r"(?m)^```(?:json)?[ \t]*\n(.*?)\n```[ \t]*$", re.DOTALL)
+
+
+COLLECTION_INSTRUCTIONS = """
+COLLECTION MODE: You are speaking from Anki's main window. There is no current card.
+Use read-only queries to inspect decks and cards before proposing changes.
+Never use edit_card or delete_card without an explicit card_id, and never use add_card
+without an explicit existing deck name. Do not claim a change was applied until tool
+results confirm it. The user's scheduler remains authoritative; do not propose a
+custom review order unless the user explicitly asks.
+
+""" + INSTRUCTIONS
+
+
+def instructions_for_collection(col, config: dict | None = None) -> str:
+    config = config or {}
+    try:
+        decks = [entry.name for entry in col.decks.all_names_and_ids()][:50]
+        notetypes = [entry.name for entry in col.models.all_names_and_ids()][:30]
+    except Exception:
+        decks, notetypes = [], []
+    settings = {
+        "interface_language": config.get("language", "auto"),
+        "api_mode": config.get("api_mode", "chat"),
+        "model": config.get("model", ""),
+        "auto_approve_actions": bool(config.get("auto_approve_actions", False)),
+        "context_import": {
+            key: bool(config.get(f"context_{key}", True))
+            for key in ("front", "back", "images", "deck", "schedule", "history")
+        },
+    }
+    permission = (
+        "DIRECT_WRITE_ALLOWED. The user has granted the AI permission to apply proposed "
+        "Anki changes immediately without a confirmation dialog. Only make changes the user "
+        "explicitly requested. Never perform unrelated or destructive edits."
+        if settings["auto_approve_actions"] else
+        "USER_CONFIRMATION_REQUIRED. Propose Anki changes, but the client will ask the user "
+        "before applying them. Do not claim a change was applied until tool results confirm it."
+    )
+    replacements = {
+        "__CARD_ID__": "0", "__DECK__": "", "__NOTETYPE__": "",
+        "__FIELDS__": "[]", "__DECKS__": repr(decks), "__NOTETYPES__": repr(notetypes),
+        "__SETTINGS__": json.dumps(settings, ensure_ascii=False),
+        "__PERMISSION__": permission,
+    }
+    result = COLLECTION_INSTRUCTIONS
+    for marker, value in replacements.items():
+        result = result.replace(marker, value)
+    return result
 
 
 def instructions_for(card, col, config: dict | None = None) -> str:
@@ -176,9 +225,30 @@ def extract_queries(answer: str) -> tuple[str, list[dict] | None]:
         queries.extend(payload["queries"])
     if not 1 <= len(queries) <= 10:
         raise ValueError("Anki queries must contain 1 to 10 requests")
+    queries = [normalize_query(query) for query in queries]
     for query in queries:
         validate_query(query)
     return _visible_without_blocks(answer, matches), queries
+
+
+def normalize_query(query: dict) -> dict:
+    """Repair harmless model mistakes before strict validation.
+
+    Search limits are frequently emitted as 0, 50, or a numeric string. A bad
+    limit should not discard the whole response when a safe value is obvious.
+    """
+    if not isinstance(query, dict):
+        return query
+    if query.get("tool") != "search_cards":
+        return query
+    normalized = dict(query)
+    raw = normalized.get("limit", 10)
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        limit = 10
+    normalized["limit"] = max(1, min(20, limit))
+    return normalized
 
 
 def validate_query(query: dict) -> None:

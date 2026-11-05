@@ -157,6 +157,10 @@ class ConversationStore:
             self.select(card_id, conversation_id)
         return conversation_id
 
+    def create_collection(self) -> int:
+        """Create a collection-level conversation stored under card id 0."""
+        return self.create(0, "Collection", "")
+
     def select(self, card_id: int, conversation_id: int) -> None:
         row = self.connection.execute(
             "SELECT card_id FROM conversations WHERE id = ?", (conversation_id,)
@@ -403,7 +407,7 @@ class ConversationStore:
             if not isinstance(entry, dict) or not isinstance(entry.get("uuid"), str) or entry["uuid"] in identities:
                 raise ValueError("Invalid conversation identifier")
             identities.add(entry["uuid"])
-            if not isinstance(entry.get("card_id"), int) or entry["card_id"] <= 0:
+            if not isinstance(entry.get("card_id"), int) or entry["card_id"] < 0:
                 raise ValueError("Invalid card identifier")
             if any(not isinstance(entry.get(key), str) for key in ("card_label", "deck_name", "title")):
                 raise ValueError("Invalid conversation metadata")

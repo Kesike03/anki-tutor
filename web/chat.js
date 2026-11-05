@@ -9,6 +9,17 @@ parser.renderer.rules.link_close = () => "";
 let latestRender = 0;
 let renderQueue = Promise.resolve();
 
+window.setTutorSpeaking = function (id, readLabel, stopLabel) {
+    const active = id === null || id === undefined ? null : String(id);
+    document.querySelectorAll('button[data-action="speak"]').forEach((button) => {
+        const speaking = active !== null && button.dataset.id === active;
+        button.textContent = speaking ? "\u25A0" : "\u25B6";
+        const label = speaking ? (stopLabel || "Stop reading") : (readLabel || "Read aloud");
+        button.title = label;
+        button.setAttribute("aria-label", label);
+    });
+};
+
 document.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-action]");
     if (button && !button.disabled) {
@@ -65,14 +76,31 @@ window.renderTutorMessages = function (payload) {
                 files.textContent = message.attachments.map((file) => file.name).join(" · ");
                 entry.append(files);
             }
+            if (message.usage?.total) {
+                const usage = document.createElement("div");
+                usage.className = "usage";
+                usage.textContent = `${Number(message.usage.total).toLocaleString()} ${payload.labels.usage_tokens}`;
+                usage.title = [
+                    `${payload.labels.usage_input}: ${Number(message.usage.input).toLocaleString()}`,
+                    `${payload.labels.usage_output}: ${Number(message.usage.output).toLocaleString()}`,
+                    `${payload.labels.usage_cached}: ${Number(message.usage.cached).toLocaleString()}`,
+                ].join(" | ");
+                entry.append(usage);
+            }
             if (message.id) {
                 const controls = document.createElement("div");
                 controls.className = "controls";
                 if (message.role === "assistant") {
                     controls.append(
                         tool("copy", message.id, "⧉", payload.labels.copy),
+                        tool("save", message.id, "\u2193", payload.labels.authoring_save_reply),
                         tool("regen", message.id, "↻", payload.labels.regenerate, payload.busy),
                     );
+                    if (payload.tts_available) {
+                        controls.append(
+                            tool("speak", message.id, "\u25B6", payload.labels.read_aloud),
+                        );
+                    }
                 } else {
                     controls.append(tool("edit", message.id, "✎", payload.labels.edit_message, payload.busy));
                 }
@@ -97,6 +125,11 @@ window.renderTutorMessages = function (payload) {
         for (const [name, value] of Object.entries(payload.theme)) {
             document.documentElement.style.setProperty(`--${name}`, value);
         }
+        window.setTutorSpeaking(
+            payload.speaking_id,
+            payload.labels.read_aloud,
+            payload.labels.stop_reading,
+        );
         await window.MathJax.startup.promise;
         if (version !== latestRender) return;
         await window.MathJax.typesetPromise([root]);

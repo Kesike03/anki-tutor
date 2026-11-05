@@ -425,3 +425,47 @@ EXTRA = {
 
 for code, additions in EXTRA.items():
     STRINGS[code].update(additions)
+
+
+def resolve_language(chosen: str) -> str:
+    """Resolve the configured UI language without importing aqt at module load."""
+    if chosen in LANGUAGES:
+        return chosen
+    if chosen not in (None, "", "auto"):
+        return "en"
+    try:
+        import anki.lang
+        locale = anki.lang.current_lang.lower().replace("_", "-")
+    except Exception:
+        return "en"
+    if locale.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")):
+        return "en"
+    base = locale.split("-")[0]
+    return base if base in LANGUAGES else "en"
+
+
+try:
+    from .authoring_i18n import AUTHORING
+except ImportError:
+    from authoring_i18n import AUTHORING
+
+for code, additions in AUTHORING.items():
+    STRINGS[code].update(additions)
+
+
+try:
+    from .home_i18n import HOME
+except ImportError:
+    from home_i18n import HOME
+
+for code, additions in HOME.items():
+    STRINGS[code].update(additions)
+
+
+try:
+    from .usage_i18n import USAGE
+except ImportError:
+    from usage_i18n import USAGE
+
+for code, additions in USAGE.items():
+    STRINGS[code].update(additions)

@@ -46,6 +46,21 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(second_profile.list_conversations(), [])
             second_profile.close()
 
+
+    def test_collection_conversations_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory), "collection/collection.anki2")
+            conversation = store.create_collection()
+            self.assertEqual(store.active(0), conversation)
+            store.add_user_message(conversation, "What is due?", "Collection prompt", [])
+            store.append(conversation, "assistant", "Three decks.")
+            self.assertEqual(store.messages(conversation)[-1]["content"], "Three decks.")
+            backup = store.export_data()
+            store.delete_all()
+            self.assertEqual(store.import_data(backup), (1, 0))
+            self.assertIsNotNone(store.active(0))
+            store.close()
+
     def test_old_profile_migrates_without_losing_messages_or_context(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from attachments import AttachmentError, load_files, local_file_references
-from harness import extract_plan, extract_queries, instructions_for, validate_action
+from harness import (
+    extract_plan, extract_queries, instructions_for,
+    instructions_for_collection, validate_action,
+)
 
 
 class HarnessTests(unittest.TestCase):
@@ -29,6 +33,14 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_action(action)
 
+
+    def test_invalid_search_limits_are_repaired(self):
+        for raw, expected in ((0, 1), (-5, 1), (50, 20), ("7", 7), ("bad", 10), (None, 10)):
+            query = {"tool": "search_cards", "query": "is:due", "limit": raw}
+            answer = "```anki-query\n" + json.dumps({"queries": [query]}) + "\n```"
+            _, queries = extract_queries(answer)
+            self.assertEqual(queries[0]["limit"], expected)
+
     def test_queries_and_hidden_permission_context(self):
         answer = 'Let me inspect.\n```anki-query\n{"queries":[{"tool":"search_cards","query":"is:due","limit":5}]}\n```\nOne moment.'
         visible, queries = extract_queries(answer)
@@ -50,6 +62,18 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("DIRECT_WRITE_ALLOWED", prompt)
         self.assertIn('"auto_approve_actions": true', prompt)
         prompt = instructions_for(card, col, {"auto_approve_actions": False})
+        self.assertIn("USER_CONFIRMATION_REQUIRED", prompt)
+
+
+    def test_collection_mode_requires_explicit_targets(self):
+        col = SimpleNamespace(
+            decks=SimpleNamespace(all_names_and_ids=lambda: [SimpleNamespace(name="Spanish")]),
+            models=SimpleNamespace(all_names_and_ids=lambda: [SimpleNamespace(name="Basic")]),
+        )
+        prompt = instructions_for_collection(col, {"auto_approve_actions": False})
+        self.assertIn("COLLECTION MODE", prompt)
+        self.assertIn("CARD_ID=0", prompt)
+        self.assertIn("without an explicit card_id", prompt)
         self.assertIn("USER_CONFIRMATION_REQUIRED", prompt)
 
     def test_attachment_types(self):

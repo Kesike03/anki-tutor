@@ -1,6 +1,7 @@
 """Payload and response adapters for four AI API families."""
 
 import base64
+import json
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
@@ -68,7 +69,11 @@ def _message_for_provider(message: dict, mode: str) -> dict:
 
 
 def build_request(
-    config: dict, system_prompt: str, messages: list[dict], images: list[dict] | None = None
+    config: dict,
+    system_prompt: str,
+    messages: list[dict],
+    images: list[dict] | None = None,
+    schema: dict | None = None,
 ) -> RequestSpec:
     mode = config.get("api_mode", "chat")
     if mode not in DEFAULTS:
@@ -123,6 +128,11 @@ def build_request(
             "model": model,
             "messages": [{"role": "system", "content": system_prompt}, *image_messages, *turns],
         }
+        if schema:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "strict": True, "schema": schema},
+            }
     elif mode == "responses":
         headers["Authorization"] = f"Bearer {key}"
         image_messages = [
@@ -138,6 +148,10 @@ def build_request(
             }
         ] if images else []
         body = {"model": model, "instructions": system_prompt, "input": image_messages + turns}
+        if schema:
+            body["text"] = {
+                "format": {"type": "json_schema", "name": "response", "schema": schema, "strict": True}
+            }
     elif mode == "claude":
         headers["x-api-key"] = key
         headers["anthropic-version"] = "2023-06-01"
@@ -164,6 +178,13 @@ def build_request(
             "system": system_prompt,
             "messages": image_messages + turns,
         }
+        if schema:
+            body["tools"] = [{
+                "name": "response",
+                "description": "Return the requested structured result.",
+                "input_schema": schema,
+            }]
+            body["tool_choice"] = {"type": "tool", "name": "response"}
     else:
         headers["x-goog-api-key"] = key
         image_contents = [
@@ -186,6 +207,10 @@ def build_request(
                 for message, turn in zip(messages, turns)
             ],
         }
+        if schema:
+            generation = body.setdefault("generationConfig", {})
+            generation["responseMimeType"] = "application/json"
+            generation["responseSchema"] = schema
     return RequestSpec(url, headers, body)
 
 
@@ -207,7 +232,11 @@ def parse_response(mode: str, data: dict) -> str:
                  for part in item.get("content", []) if part.get("type") == "output_text"]
             )
         elif mode == "claude":
-            text = _text_parts(
+            tools = [
+                part.get("input") for part in data["content"]
+                if part.get("type") == "tool_use" and isinstance(part.get("input"), dict)
+            ]
+            text = json.dumps(tools[-1], ensure_ascii=False) if tools else _text_parts(
                 [part for part in data["content"] if part.get("type") == "text"]
             )
         elif mode == "gemini":
@@ -219,6 +248,57 @@ def parse_response(mode: str, data: dict) -> str:
     if not text:
         raise ProtocolError("empty_response")
     return text
+
+
+def parse_usage(mode: str, data: dict) -> dict | None:
+    """Normalize provider token usage into input/output/total/cached counts."""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage") or data.get("usage_metadata") or data.get("usageMetadata")
+    if not isinstance(usage, dict):
+        return None
+
+    def number(*keys):
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        return 0
+
+    if mode == "chat":
+        input_tokens = number("prompt_tokens", "input_tokens")
+        output_tokens = number("completion_tokens", "output_tokens")
+        total_tokens = number("total_tokens")
+        details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = int(details.get("cached_tokens", 0) or 0)
+    elif mode == "responses":
+        input_tokens = number("input_tokens", "prompt_tokens")
+        output_tokens = number("output_tokens", "completion_tokens")
+        total_tokens = number("total_tokens")
+        details = usage.get("input_tokens_details") or {}
+        cached_tokens = int(details.get("cached_tokens", 0) or 0)
+    elif mode == "claude":
+        input_tokens = number("input_tokens", "prompt_tokens")
+        output_tokens = number("output_tokens", "completion_tokens")
+        cached_tokens = number("cache_read_input_tokens") + number("cache_creation_input_tokens")
+        total_tokens = number("total_tokens") or input_tokens + output_tokens + cached_tokens
+    elif mode == "gemini":
+        input_tokens = number("promptTokenCount", "input_tokens")
+        output_tokens = number("candidatesTokenCount", "output_tokens")
+        total_tokens = number("totalTokenCount", "total_tokens")
+        cached_tokens = number("cachedContentTokenCount")
+    else:
+        return None
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+    if not (input_tokens or output_tokens or total_tokens or cached_tokens):
+        return None
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "total": total_tokens,
+        "cached": cached_tokens,
+    }
 
 
 def provider_error(status: int, data: object) -> str:
