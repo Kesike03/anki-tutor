@@ -295,6 +295,8 @@ class PanelTests(unittest.TestCase):
         self.assertTrue(self.panel.settings_dialog.isVisible())
         self.assertEqual(self.panel.settings_tabs.count(), 4)
         self.assertIs(self.panel.settings_tabs.widget(3), self.panel.usage_page)
+        self.assertEqual(self.panel.usage_page.range_combo.count(), 5)
+        self.assertEqual(self.panel.usage_page.range_combo.itemData(1), 1)
         self.panel.font_size_spin.setValue(20)
         self.assertEqual(self.panel.config["font_size"], 20)
         self.assertEqual(self.panel._applied_font_size, 20)

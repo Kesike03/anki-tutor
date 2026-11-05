@@ -55,6 +55,7 @@ class TokenUsagePage(QWidget):
         top = QHBoxLayout()
         self.range_combo = QComboBox()
         self.range_combo.addItem("", 0)
+        self.range_combo.addItem("", 1)
         self.range_combo.addItem("", 7)
         self.range_combo.addItem("", 30)
         self.range_combo.addItem("", 90)
@@ -98,9 +99,10 @@ class TokenUsagePage(QWidget):
     def _translate(self) -> None:
         text = self.panel.text
         self.range_combo.setItemText(0, text("usage_range_all"))
-        self.range_combo.setItemText(1, text("usage_range_7"))
-        self.range_combo.setItemText(2, text("usage_range_30"))
-        self.range_combo.setItemText(3, text("usage_range_90"))
+        self.range_combo.setItemText(1, text("usage_range_24h"))
+        self.range_combo.setItemText(2, text("usage_range_7"))
+        self.range_combo.setItemText(3, text("usage_range_30"))
+        self.range_combo.setItemText(4, text("usage_range_90"))
         self.refresh_button.setText(text("usage_refresh"))
         self.export_button.setText(text("usage_export"))
         self.tabs.setTabText(0, text("usage_models"))

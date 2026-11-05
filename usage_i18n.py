@@ -158,3 +158,14 @@ USAGE = {
         "usage_range_90": "Letzte 90 Tage",
     },
 }
+
+USAGE_EXTRA = {
+    "en": {"usage_range_24h": "Last 24 hours"},
+    "ja": {"usage_range_24h": "過去24時間"},
+    "zh": {"usage_range_24h": "最近 24 小时"},
+    "es": {"usage_range_24h": "Últimas 24 horas"},
+    "fr": {"usage_range_24h": "24 dernières heures"},
+    "de": {"usage_range_24h": "Letzte 24 Stunden"},
+}
+for code, additions in USAGE_EXTRA.items():
+    USAGE[code].update(additions)
