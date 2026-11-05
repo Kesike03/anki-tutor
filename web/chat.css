@@ -8,31 +8,36 @@
 }
 
 html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
-body { font: 13px/1.55 system-ui, sans-serif; overflow-wrap: anywhere; }
+body { font: var(--font-size, 13px)/1.55 system-ui, sans-serif; overflow-wrap: anywhere; }
 #thread { display: flex; flex-direction: column; gap: 12px; padding: 14px; }
 .message { box-sizing: border-box; align-self: flex-start; max-width: 100%;
-    border: 1px solid var(--border); border-radius: 5px; background: var(--surface);
-    padding: 9px 12px 10px; min-width: 0; }
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+    padding: 10px 13px 11px; min-width: 0; }
 .message.user { align-self: flex-end; background: var(--user); border-color: var(--user); }
-.role { color: var(--muted); font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+.role { color: var(--muted); font-size: max(10px, calc(var(--font-size, 13px) - 2px));
+    font-weight: 600; margin-bottom: 5px; }
 .body > :first-child { margin-top: 0; }
 .body > :last-child { margin-bottom: 0; }
 .body p, .body ul, .body ol, .body blockquote, .body pre { margin: 6px 0; }
 .body ul, .body ol { padding-left: 20px; }
 .body pre { white-space: pre-wrap; overflow-x: auto; border-radius: 4px;
     padding: 8px 10px; background: var(--bg); }
-.body code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.body code { font-family: ui-monospace, Consolas, monospace;
+    font-size: max(10px, calc(var(--font-size, 13px) - 1px)); }
 .body :not(pre) > code { background: var(--bg); padding: 1px 3px; }
 .body blockquote { border-left: 3px solid var(--border); padding-left: 10px; color: var(--muted); }
 .body table { border-collapse: collapse; max-width: 100%; display: block; overflow-x: auto; }
 .body th, .body td { border: 1px solid var(--border); padding: 4px 7px; }
 .body img { max-width: 100%; }
 .MathJax { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
-.files { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; margin-top: 6px; }
+.files { font-size: max(10px, calc(var(--font-size, 13px) - 2px));
+    color: var(--muted); overflow-wrap: anywhere; margin-top: 6px; }
 .controls { display: flex; gap: 2px; align-items: center; margin: 6px -4px -5px;
     min-height: 27px; }
 .controls button { border: 0; background: transparent; color: var(--muted); cursor: pointer;
-    font-size: 17px; min-width: 28px; height: 26px; border-radius: 4px; padding: 0 4px; }
+    font-size: calc(var(--font-size, 13px) + 4px); min-width: 28px; height: 26px;
+    border-radius: 4px; padding: 0 4px; }
 .controls button:hover:enabled { background: var(--bg); color: var(--text); }
 .controls button:disabled { opacity: .35; cursor: default; }
-.branch-count { color: var(--muted); font-size: 11px; min-width: 28px; text-align: center; }
+.branch-count { color: var(--muted); font-size: max(10px, calc(var(--font-size, 13px) - 2px));
+    min-width: 28px; text-align: center; }

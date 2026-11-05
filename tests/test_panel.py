@@ -63,7 +63,7 @@ def load_panel():
         "QTimer", "QToolButton", "QUrl", "QVBoxLayout", "QWidget", "Qt",
         "QColor", "QPalette", "QTreeWidget", "QTreeWidgetItem", "QDialog",
         "QFileDialog", "QInputDialog", "QListWidget", "QListWidgetItem", "QApplication",
-        "QBuffer", "QIODevice", "QImage",
+        "QBuffer", "QIODevice", "QImage", "QSpinBox",
     ):
         for source in (QtWidgets, QtCore, QtGui):
             if hasattr(source, name):
@@ -261,15 +261,42 @@ class PanelTests(unittest.TestCase):
 
         self.panel.setFloating(True)
         self.app.processEvents()
+        self.app.processEvents()
         self.assertTrue(self.panel.isFloating())
         self.assertTrue(self.panel.dock_button.isVisible())
         self.assertEqual(self.panel.dock_button.toolTip(), "Dock to Anki")
+        self.assertGreaterEqual(self.panel.width(), 600)
+        self.assertGreaterEqual(self.panel.height(), 480)
+        self.assertEqual(self.panel.minimumWidth(), 420)
 
         self.panel.dock_button.click()
+        self.app.processEvents()
         self.app.processEvents()
         self.assertFalse(self.panel.isFloating())
         self.assertEqual(self.mw.dockWidgetArea(self.panel), QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
         self.assertFalse(self.panel.dock_button.isVisible())
+        self.assertEqual(self.panel.minimumWidth(), 240)
+        self.assertLessEqual(self.panel.width(), 500)
+
+    def test_settings_open_as_dialog_and_font_size_applies(self):
+        self.panel._open_settings()
+        self.assertIsNotNone(self.panel.settings_dialog)
+        self.assertIs(self.panel.settings_scroll.parent(), self.panel.settings_dialog)
+        self.assertTrue(self.panel.settings_dialog.isVisible())
+        self.panel.font_size_spin.setValue(20)
+        self.assertEqual(self.panel.config["font_size"], 20)
+        self.assertEqual(self.panel._applied_font_size, 20)
+        self.assertIn("font-size: 20px", self.panel.styleSheet())
+        self.panel.settings_dialog.close()
+
+    def test_settings_dialog_survives_profile_reopen(self):
+        self.panel._open_settings()
+        self.panel.close_profile()
+        self.panel.open_profile()
+        self.panel._open_settings()
+        self.assertIsNotNone(self.panel.settings_dialog)
+        self.assertIs(self.panel.settings_scroll.parent(), self.panel.settings_dialog)
+        self.panel.settings_dialog.close()
 
     def test_two_conversations_and_anki_language(self):
         import anki.lang

@@ -14,6 +14,7 @@ from aqt.qt import (
     QCheckBox,
     QColor,
     QComboBox,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -30,6 +31,7 @@ from aqt.qt import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QTextEdit,
@@ -145,6 +147,7 @@ class TutorPanel(QDockWidget):
         self.card = None
         self.conversation_id = None
         self.covered = False
+        self._docked_width = 410
         self.drafts: dict[tuple[int, int | None], str] = {}
         self.attachment_drafts: dict[tuple[int, int | None], list[dict]] = {}
         self.attachments: list[dict] = []
@@ -152,10 +155,12 @@ class TutorPanel(QDockWidget):
         self.pending: dict[int, PendingRequest] = {}
         self.network = QNetworkAccessManager(self)
         self.history_dialog = None
+        self.settings_dialog = None
+        self._applied_font_size = None
 
         self.setObjectName("ankiTutorDock")
         self.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(240)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
@@ -224,9 +229,8 @@ class TutorPanel(QDockWidget):
         header_row.addWidget(self.dock_button)
         self.settings_button = QToolButton()
         self.settings_button.setIcon(self._icon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
-        self.settings_button.setCheckable(True)
         self.settings_button.setObjectName("tutorTool")
-        self.settings_button.clicked.connect(self._toggle_settings)
+        self.settings_button.clicked.connect(self._open_settings)
         header_row.addWidget(self.settings_button)
         self.clear_button = QToolButton()
         self.clear_button.setIcon(self._icon(QStyle.StandardPixmap.SP_DialogDiscardButton))
@@ -264,13 +268,11 @@ class TutorPanel(QDockWidget):
         self.settings_scroll.setObjectName("tutorSettingsScroll")
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setMaximumHeight(345)
-        self.settings_scroll.setVisible(False)
         settings_content = QWidget()
         settings_content.setObjectName("tutorSettings")
         settings_layout = QVBoxLayout(settings_content)
-        settings_layout.setContentsMargins(16, 12, 16, 16)
-        settings_layout.setSpacing(6)
+        settings_layout.setContentsMargins(20, 16, 20, 22)
+        settings_layout.setSpacing(8)
 
         self.field_labels = {}
         self.mode_combo = QComboBox()
@@ -304,6 +306,13 @@ class TutorPanel(QDockWidget):
             self.language_combo.addItem(name, code)
         self.language_combo.setCurrentIndex(self.language_combo.findData(self.config["language"]))
         self._add_field(settings_layout, "language", self.language_combo)
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(11, 22)
+        self.font_size_spin.setSuffix(" px")
+        self.font_size_spin.setValue(max(11, min(22, int(self.config.get("font_size", 14)))))
+        self.font_size_spin.valueChanged.connect(self._save_settings)
+        self._add_field(settings_layout, "font_size", self.font_size_spin)
 
         prompt_row = QHBoxLayout()
         self.prompt_label = QLabel()
@@ -340,7 +349,6 @@ class TutorPanel(QDockWidget):
         self.auto_approve_check.toggled.connect(self._save_settings)
         settings_layout.addWidget(self.auto_approve_check)
         self.settings_scroll.setWidget(settings_content)
-        layout.addWidget(self.settings_scroll)
 
         self.pages = QStackedWidget()
         self.pages.setObjectName("tutorPages")
@@ -363,6 +371,7 @@ class TutorPanel(QDockWidget):
         self.cover_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.reveal_button = QPushButton()
         self.reveal_button.setObjectName("tutorPrimary")
+        self.reveal_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.reveal_button.clicked.connect(self._reveal)
         self.cover_page.layout().addWidget(self.cover_label)
         self.cover_page.layout().addWidget(self.cover_count)
@@ -457,7 +466,7 @@ class TutorPanel(QDockWidget):
         page = QWidget()
         page.setObjectName("tutorPage")
         column = QVBoxLayout(page)
-        column.setContentsMargins(26, 20, 26, 20)
+        column.setContentsMargins(16, 20, 16, 20)
         column.setSpacing(12)
         column.addStretch(1)
         return page
@@ -475,7 +484,7 @@ class TutorPanel(QDockWidget):
         self.heading.setText(self.text("title"))
         self.dock_button.setToolTip(self.text("dock"))
         self.dock_button.setAccessibleName(self.text("dock"))
-        self.settings_button.setToolTip(self.text("hide_settings" if self.settings_button.isChecked() else "view_settings"))
+        self.settings_button.setToolTip(self.text("view_settings"))
         self.settings_button.setAccessibleName(self.text("settings"))
         self.clear_button.setToolTip(self.text("clear"))
         self.clear_button.setAccessibleName(self.text("clear"))
@@ -509,14 +518,75 @@ class TutorPanel(QDockWidget):
         self.remove_attachment_button.setToolTip(self.text("remove_attachment"))
         if self.history_dialog is not None:
             self.history_dialog.refresh()
+        if self.settings_dialog is not None:
+            self.settings_dialog.setWindowTitle(self.text("settings"))
+            self.settings_title.setText(self.text("settings"))
+            self.settings_close_button.setText(self.text("close"))
         self._refresh()
 
-    def _toggle_settings(self, checked: bool) -> None:
-        self.settings_scroll.setVisible(checked)
-        self.settings_button.setToolTip(self.text("hide_settings" if checked else "view_settings"))
+    def _open_settings(self) -> None:
+        if self.settings_dialog is None:
+            dialog = QDialog(self.mw)
+            dialog.setObjectName("tutorSettingsDialog")
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            dialog.setMinimumSize(520, 480)
+            dialog.resize(680, 760)
+            dialog_layout = QVBoxLayout(dialog)
+            dialog_layout.setContentsMargins(0, 0, 0, 0)
+            dialog_layout.setSpacing(0)
+            self.settings_title = QLabel()
+            self.settings_title.setObjectName("tutorSettingsTitle")
+            dialog_layout.addWidget(self.settings_title)
+            divider = QFrame()
+            divider.setObjectName("tutorSettingsDivider")
+            divider.setFixedHeight(1)
+            dialog_layout.addWidget(divider)
+            self.settings_scroll.setMaximumHeight(16777215)
+            dialog_layout.addWidget(self.settings_scroll, 1)
+            button_row = QHBoxLayout()
+            button_row.setContentsMargins(16, 8, 16, 12)
+            button_row.addStretch(1)
+            self.settings_close_button = QPushButton()
+            self.settings_close_button.clicked.connect(dialog.accept)
+            button_row.addWidget(self.settings_close_button)
+            dialog_layout.addLayout(button_row)
+            self.settings_dialog = dialog
+            self._apply_theme()
+            self._translate()
+        self.settings_dialog.setStyleSheet(self.styleSheet())
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
 
     def _floating_changed(self, floating: bool) -> None:
         self.dock_button.setVisible(floating)
+        if floating:
+            QTimer.singleShot(0, self._apply_floating_geometry)
+        else:
+            self.setMinimumWidth(240)
+            QTimer.singleShot(0, self._restore_docked_width)
+
+    def _apply_floating_geometry(self) -> None:
+        if not self.isFloating():
+            return
+        self.setMinimumWidth(420)
+        screen = self.screen() or self.mw.screen()
+        available = screen.availableGeometry()
+        width = min(720, max(420, available.width() - 80))
+        height = min(820, max(480, available.height() - 80))
+        frame = self.mw.frameGeometry()
+        x = frame.center().x() - width // 2
+        y = frame.center().y() - height // 2
+        x = max(available.left(), min(x, available.right() - width))
+        y = max(available.top(), min(y, available.bottom() - height))
+        self.setGeometry(x, y, width, height)
+
+    def _restore_docked_width(self) -> None:
+        if self.isFloating():
+            return
+        self.setMinimumWidth(240)
+        width = max(240, min(self._docked_width, 900))
+        self.mw.resizeDocks([self], [width], Qt.Orientation.Horizontal)
 
     def _dock_to_main(self) -> None:
         self.mw.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self)
@@ -525,7 +595,8 @@ class TutorPanel(QDockWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.settings_scroll.setMaximumHeight(max(140, min(345, self.height() // 2)))
+        if not self.isFloating() and self.width() >= 240:
+            self._docked_width = self.width()
 
     def _toggle_key(self) -> None:
         visible = self.key_input.echoMode() == QLineEdit.EchoMode.Password
@@ -556,6 +627,7 @@ class TutorPanel(QDockWidget):
         self._render_messages()
 
     def _save_settings(self) -> None:
+        previous_font = self._applied_font_size
         self.config.update(
             api_mode=self.mode_combo.currentData(),
             api_key=self.key_input.text(),
@@ -563,12 +635,15 @@ class TutorPanel(QDockWidget):
             api_path=self.path_input.text().strip(),
             model=self.model_input.text().strip(),
             language=self.language_combo.currentData(),
+            font_size=self.font_size_spin.value(),
             system_prompt=self.prompt_input.toPlainText(),
         )
         for name, check in self.checks.items():
             self.config[f"context_{name}"] = check.isChecked()
         self.config["auto_approve_actions"] = self.auto_approve_check.isChecked()
         self.mw.addonManager.writeConfig(__name__, self.config)
+        if previous_font != self.config["font_size"]:
+            self._apply_theme()
 
     def open_profile(self) -> None:
         self.close_profile()
@@ -593,6 +668,11 @@ class TutorPanel(QDockWidget):
         if self.history_dialog is not None:
             self.history_dialog.close()
             self.history_dialog = None
+        if self.settings_dialog is not None:
+            self.settings_scroll.setParent(None)
+            self.settings_dialog.close()
+            self.settings_dialog.deleteLater()
+            self.settings_dialog = None
         self._refresh()
 
     def _draft_key(self) -> tuple[int, int | None]:
@@ -862,6 +942,7 @@ class TutorPanel(QDockWidget):
             "muted": palette.color(QPalette.ColorRole.PlaceholderText).name(),
             "border": palette.color(QPalette.ColorRole.Mid).name(),
             "user": self._user_color(),
+            "font-size": f"{max(11, min(22, int(self.config.get('font_size', 14))))}px",
         }
         payload = {
             "messages": messages, "you": self.text("you"), "tutor": self.text("tutor"),
@@ -978,8 +1059,7 @@ class TutorPanel(QDockWidget):
             self.errors[conversation_id] = self.text(key) if key in ("missing_key", "missing_model", "invalid_host", "invalid_path", "invalid_response", "image_error", "pdf_not_supported") else key
             self._refresh()
             if str(error) in ("missing_key", "missing_model"):
-                self.settings_button.setChecked(True)
-                self._toggle_settings(True)
+                self._open_settings()
             return
         except Exception:
             traceback.print_exc()
@@ -1006,8 +1086,6 @@ class TutorPanel(QDockWidget):
         self.pending[conversation_id] = pending
         self.errors.pop(conversation_id, None)
         self.covered = False
-        self.settings_button.setChecked(False)
-        self._toggle_settings(False)
         self._refresh_conversations()
         self._refresh()
         self._render_messages()
@@ -1027,8 +1105,7 @@ class TutorPanel(QDockWidget):
                 "invalid_response", "image_error", "pdf_not_supported",
             ) else key
             if key in ("missing_key", "missing_model"):
-                self.settings_button.setChecked(True)
-                self._toggle_settings(True)
+                self._open_settings()
             self._refresh()
             return False
         except Exception:
@@ -1229,25 +1306,35 @@ class TutorPanel(QDockWidget):
 
         user = mix(surface_color, accent_color, 0.13 if not theme_manager.night_mode else 0.24)
         danger = mix(bg_color, QColor("#d85a53"), 0.15)
+        font = max(11, min(22, int(self.config.get("font_size", 14))))
+        self._applied_font_size = font
         self.setStyleSheet(f"""
             QWidget#tutorRoot, QWidget#tutorPage, QStackedWidget#tutorPages,
-            QScrollArea#tutorSettingsScroll {{ background: {bg}; color: {text}; }}
+            QScrollArea#tutorSettingsScroll, QDialog#tutorSettingsDialog {{
+                background: {bg}; color: {text}; font-size: {font}px;
+            }}
             QFrame#tutorHeader, QFrame#tutorFooter, QWidget#tutorSettings {{
                 background: {bg}; color: {text};
             }}
             QFrame#tutorHeader {{ border-bottom: 1px solid {border}; }}
             QFrame#tutorConversationBar {{ background: {bg}; border-bottom: 1px solid {border}; }}
             QFrame#tutorFooter {{ border-top: 1px solid {border}; }}
-            QLabel#tutorHeading {{ color: {text}; font-size: 14px; font-weight: 600; }}
-            QLabel#tutorDetail, QLabel#tutorEmpty {{ color: {muted}; font-size: 12px; }}
-            QLabel#tutorFieldLabel, QLabel#tutorSectionLabel {{ color: {muted}; font-size: 11px; font-weight: 600; }}
+            QLabel#tutorHeading {{ color: {text}; font-size: {font + 1}px; font-weight: 600; }}
+            QLabel#tutorSettingsTitle {{ color: {text}; font-size: {font + 3}px;
+                font-weight: 700; padding: 16px 20px 10px; }}
+            QFrame#tutorSettingsDivider {{ background: {border}; border: 0;
+                margin-left: 20px; margin-right: 20px; }}
+            QLabel#tutorDetail, QLabel#tutorEmpty {{ color: {muted}; font-size: {max(10, font - 2)}px; }}
+            QLabel#tutorFieldLabel, QLabel#tutorSectionLabel {{ color: {muted};
+                font-size: {max(9, font - 3)}px; font-weight: 600; }}
             QToolButton#tutorTool {{ border: 0; background: transparent; border-radius: 4px;
                 padding: 5px; min-width: 26px; min-height: 26px; }}
             QToolButton#tutorTool:hover, QToolButton#tutorTool:checked {{ background: {user}; }}
             QPushButton#tutorLinkButton {{ border: 0; background: transparent;
-                color: {accent}; padding: 4px; }}
+                color: {accent}; padding: 4px; font-size: {max(10, font - 2)}px; }}
             QListWidget#tutorAttachmentList {{ background: {surface}; color: {text};
-                border: 1px solid {border}; border-radius: 4px; padding: 2px; }}
+                border: 1px solid {border}; border-radius: 4px; padding: 2px;
+                font-size: {max(10, font - 2)}px; }}
             QListWidget#tutorAttachmentList::item {{ padding: 3px 5px; }}
             QListWidget#tutorAttachmentList::item:selected {{
                 background: {accent}; color: {surface};
@@ -1255,5 +1342,16 @@ class TutorPanel(QDockWidget):
             QFrame#tutorError QLabel {{ color: {text}; }}
             QToolButton#tutorSend {{ min-width: 30px; min-height: 30px; }}
             QFrame#tutorError {{ background: {danger}; color: {text}; }}
+            QDialog#tutorSettingsDialog QLineEdit, QDialog#tutorSettingsDialog QComboBox,
+            QDialog#tutorSettingsDialog QPlainTextEdit, QDialog#tutorSettingsDialog QSpinBox,
+            QDialog#tutorSettingsDialog QCheckBox, QDialog#tutorSettingsDialog QPushButton {{
+                font-size: {font}px;
+            }}
+            QDialog#tutorSettingsDialog QLineEdit, QDialog#tutorSettingsDialog QComboBox,
+            QDialog#tutorSettingsDialog QPlainTextEdit, QDialog#tutorSettingsDialog QSpinBox {{
+                padding: 5px;
+            }}
         """)
+        if self.settings_dialog is not None:
+            self.settings_dialog.setStyleSheet(self.styleSheet())
         self._render_messages()

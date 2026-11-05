@@ -14,7 +14,8 @@ Anki Tutor adds an AI chat panel to Anki's review window. Each card can have mul
 - **Multiple conversations per card:** Switch discussions or start a new one using the controls above the chat. Saved conversations are covered when you return to a card; reveal or select a discussion to continue.
 - **Readable answers:** Markdown is rendered by a bundled parser. MathJax uses Anki's own bundled resources and accepts `\(...\)`, `\[...\]`, `$...$`, and `$$...$$` formulas.
 - **History management:** Browse conversations grouped by card, preview messages, delete a conversation or a card's history, clear the entire profile history, and export/import a portable JSON backup. Re-importing the same backup skips duplicates.
-- **Unobtrusive interface:** The right-hand panel can be resized, floated, or closed. Its colors follow Anki's light and dark themes. A button in the floating panel docks it back on the right.
+- **Comfortable interface:** Open settings in a separate window, choose a font size from 11–22 px, and keep the panel readable at any width. The chat text, controls, and settings window scale together.
+- **Unobtrusive interface:** The right-hand panel can be resized, docked, floated into a roomy chat window, or closed. Its colors follow Anki's light and dark themes. A button in the floating panel docks it back on the right.
 - **Flexible providers:** OpenAI-compatible Chat Completions, OpenAI-compatible Responses, Anthropic Claude Messages, and Google Gemini. The host, path, model ID, and system prompt are editable.
 - **Six interface languages:** Follows Anki's interface language by default when available (English, Japanese, Simplified Chinese, Spanish, French, and German). You can choose a language manually.
 
@@ -27,7 +28,7 @@ You can also build the package from this repository with `python scripts/package
 ## Getting Started
 
 1. Open a card in Anki's review screen. The tutor appears on the right. If you closed it, enable **Anki Tutor** from Anki's View menu.
-2. Open the panel settings. Select an API mode, enter your API key and model ID, and confirm the host and path. The defaults are shown below; replace them for compatible third-party providers.
+2. Open the settings window. Select an API mode, enter your API key and model ID, confirm the host and path, and choose a comfortable font size. The defaults are shown below; replace them for compatible third-party providers.
 3. Adjust the system prompt and the context checkboxes as needed. The front, back, images, deck/template, scheduling data, and review history are selected by default.
 4. Ask a question. **Enter** sends it; **Shift+Enter** adds a new line. Requests run in the background, so you can continue studying while the response arrives. Use the conversation selector to return to another discussion on the same card; the plus button starts a new one. Use the paperclip/plus control to attach files.
 5. Hover under a user message to edit and resend it, or under an assistant reply to copy or regenerate it. When more than one version exists, use the arrow buttons to switch that message and its following context.

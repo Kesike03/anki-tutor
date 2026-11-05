@@ -122,6 +122,7 @@ class StorageTests(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertEqual(config["system_prompt"], SYSTEM_PROMPT)
         self.assertEqual(config["language"], "auto")
+        self.assertEqual(config["font_size"], 14)
 
 
 if __name__ == "__main__":
