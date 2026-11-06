@@ -182,6 +182,7 @@ class TutorPanel(QDockWidget):
         self.collection_chat_open = False
         self.review_card = None
         self.review_conversation_id = None
+        self.answer_visible = True
         self._insights = None
         self._insights_at = 0.0
         self._docked_width = 410
@@ -967,6 +968,12 @@ class TutorPanel(QDockWidget):
         self._refresh()
         self._refresh_home()
 
+    def set_answer_visible(self, visible: bool) -> None:
+        if self.answer_visible == visible:
+            return
+        self.answer_visible = visible
+        self._refresh()
+
     def show_card(self, card) -> None:
         if self.store is None:
             return
@@ -1137,8 +1144,14 @@ class TutorPanel(QDockWidget):
             self.store.messages(self.conversation_id)
             if available and self.conversation_id and chat_open else []
         )
-        self.conversation_bar.setVisible(chat_open)
-        self.new_button.setEnabled(chat_open)
+        reviewing_hidden = (
+            not collection
+            and self.review_card is not None
+            and card.id == self.review_card.id
+            and not self.answer_visible
+        )
+        self.conversation_bar.setVisible(chat_open and not reviewing_hidden)
+        self.new_button.setEnabled(chat_open and not reviewing_hidden)
         self.conversation_combo.setEnabled(chat_open and self.conversation_id is not None)
         self.clear_button.setEnabled(chat_open and self.conversation_id is not None)
         self.authoring_bar.setVisible(

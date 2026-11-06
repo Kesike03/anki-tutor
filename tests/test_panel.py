@@ -671,6 +671,14 @@ class PanelTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+
+    def test_conversation_titles_are_hidden_before_answer(self):
+        self.panel.set_answer_visible(False)
+        self.panel.show_card(self.card(101))
+        self.assertTrue(self.panel.conversation_bar.isHidden())
+        self.panel.set_answer_visible(True)
+        self.assertFalse(self.panel.conversation_bar.isHidden())
+
     def test_two_conversations_and_anki_language(self):
         import anki.lang
 

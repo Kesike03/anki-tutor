@@ -27,11 +27,13 @@ def _on_profile_close() -> None:
 
 def _on_question(card) -> None:
     if _panel is not None:
+        _panel.set_answer_visible(False)
         _panel.show_card(card)
 
 
 def _on_answer(card) -> None:
     if _panel is not None:
+        _panel.set_answer_visible(True)
         _panel.show_card(card)
 
 
