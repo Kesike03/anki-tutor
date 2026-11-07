@@ -219,14 +219,17 @@ class ConversationStore:
 
     def message(self, conversation_id: int, message_id: int) -> dict:
         row = self.connection.execute(
-            """SELECT id, parent_id, role, content, attachments_json
+            """SELECT id, parent_id, role, content, attachments_json, created_at
                FROM chat_messages WHERE conversation_id = ? AND id = ?""",
             (conversation_id, message_id),
         ).fetchone()
         if row is None:
             raise ValueError("Message not found in conversation")
-        return {"id": row[0], "parent_id": row[1], "role": row[2],
-                "content": row[3], "attachments": json.loads(row[4])}
+        return {
+            "id": row[0], "parent_id": row[1], "role": row[2],
+            "content": row[3], "attachments": json.loads(row[4]),
+            "created_at": row[5],
+        }
 
     def _display_message(self, conversation_id: int, message_id: int) -> dict:
         message = self.message(conversation_id, message_id)

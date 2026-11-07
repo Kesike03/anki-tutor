@@ -4,6 +4,7 @@ import base64
 import json
 import time
 import traceback
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -453,7 +454,7 @@ class TutorPanel(QDockWidget):
         self.context_note.setObjectName("tutorDetail")
         settings_layout.addWidget(self.context_note)
         self.checks = {}
-        for key in ("front", "back", "images", "deck", "schedule", "history"):
+        for key in ("front", "back", "images", "deck", "schedule", "history", "timestamps"):
             check = QCheckBox()
             check.setChecked(self.config.get(f"context_{key}", True))
             settings_layout.addWidget(check)
@@ -1608,6 +1609,24 @@ class TutorPanel(QDockWidget):
         if history and history[-1]["role"] == "user":
             self._request(None, target_user_id=history[-1]["id"])
 
+    def _api_history(self, history: list[dict]) -> list[dict]:
+        if not self.config.get("context_timestamps", True):
+            return history
+        result = []
+        for message in history:
+            item = dict(message)
+            timestamp = item.get("created_at")
+            if timestamp:
+                try:
+                    stamp = datetime.fromtimestamp(int(timestamp)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    item["content"] = f"[{stamp}] {item.get('content', '')}".rstrip()
+                except (TypeError, ValueError, OSError):
+                    pass
+            result.append(item)
+        return result
+
     def _request(
         self, new_message: str | None, attachments: list[dict] | None = None,
         target_user_id: int | None = None,
@@ -1629,7 +1648,11 @@ class TutorPanel(QDockWidget):
             if not history or history[-1]["role"] != "user":
                 return
         if new_message is not None:
-            history.append({"role": "user", "content": new_message, "attachments": attachments or []})
+            history.append({
+                "role": "user", "content": new_message,
+                "attachments": attachments or [], "created_at": int(time.time()),
+            })
+        api_history = self._api_history(history)
         try:
             saved_context = self.store.context(conversation_id)
             if saved_context is None:
@@ -1649,7 +1672,7 @@ class TutorPanel(QDockWidget):
                 system_prompt = prompt + "\n\n" + instructions_for(
                     self.card, self.mw.col, self.config
                 )
-            build_request(self.config, system_prompt, history, images)
+            build_request(self.config, system_prompt, api_history, images)
         except (ProtocolError, ImageContextError) as error:
             key = str(error)
             self.errors[conversation_id] = self.text(key) if key in ("missing_key", "missing_model", "invalid_host", "invalid_path", "invalid_response", "image_error", "pdf_not_supported") else key
@@ -1681,7 +1704,7 @@ class TutorPanel(QDockWidget):
         )
         pending = PendingRequest(
             None, self.config["api_mode"], self.config["api_key"], target_user_id,
-            owner_id, deck_name, history, system_prompt, images,
+            owner_id, deck_name, api_history, system_prompt, images,
         )
         self.pending[conversation_id] = pending
         self.errors.pop(conversation_id, None)

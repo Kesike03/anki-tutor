@@ -4,7 +4,7 @@ Anki Tutor adds an AI chat panel to Anki's review window. Each card can have mul
 
 ## Features
 
-- **Card-aware conversations:** The front, back, deck and template, scheduling settings, and complete review log can be included in the assistant's context. Choose which fields to share before starting a conversation.
+- **Card-aware conversations:** The front, back, deck and template, scheduling settings, and complete review log can be included in the assistant's context. Choose which fields to share before starting a conversation. Message timestamps can also be included as hidden context for the model; they are never shown in the chat UI.
 - **Study home:** In Anki's main window the assistant shows due/new/learning counts, 30-day retention, leeches, today's review signal, recent conversations, and a focus summary. It is a launch point for collection chat, weak-area analysis, history, and Browser batch work.
 - **Collection-level chat:** Ask about decks, cards, review data, or study strategy without opening a card. The assistant uses read-only queries first and must specify a card or deck before proposing a write. Collection conversations are stored separately from card conversations and are included in history export/import.
 - **Weak-area analysis:** A local, read-only report combines review history, lapses, ease, leech status, recent Again ratings, and FSRS memory data. It groups weak decks/tags and shows a compact card table. It never changes scheduling or review order.

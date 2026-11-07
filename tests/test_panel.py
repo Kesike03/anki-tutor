@@ -679,6 +679,16 @@ class PanelTests(unittest.TestCase):
         self.panel.set_answer_visible(True)
         self.assertFalse(self.panel.conversation_bar.isHidden())
 
+
+    def test_api_history_timestamps_are_optional(self):
+        history = [{"role": "user", "content": "Hello", "created_at": 1700000000}]
+        self.panel.config["context_timestamps"] = True
+        stamped = self.panel._api_history(history)
+        self.assertRegex(stamped[0]["content"], r"^\[\d{4}-\d{2}-\d{2} ")
+        self.panel.config["context_timestamps"] = False
+        plain = self.panel._api_history(history)
+        self.assertEqual(plain[0]["content"], "Hello")
+
     def test_two_conversations_and_anki_language(self):
         import anki.lang
 

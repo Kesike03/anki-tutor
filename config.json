@@ -19,5 +19,6 @@
   "tts_rate": 0.0,
   "tts_volume": 0.8,
   "tts_skip_code": true,
-  "tts_skip_math": true
+  "tts_skip_math": true,
+  "context_timestamps": true
 }
